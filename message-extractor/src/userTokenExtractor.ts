@@ -48,6 +48,7 @@ import {
 import { balanceSegmentsByDensity, type BalancedSegments } from './segments.js';
 import { DiscordGateway } from './gateway.js';
 import { LiveCapture, type LiveMessageSource, type LiveCaptureOptions } from './liveCapture.js';
+import { acquireWriterLock, type WriterLockHandle } from './writerLock.js';
 import { dirname } from 'path';
 import { createWriteStream, type WriteStream } from 'fs';
 import { existsSync, mkdirSync } from 'fs';
@@ -122,6 +123,8 @@ export class UserTokenExtractor {
   private readonly liveCaptures = new Set<LiveCapture>();
   private stopRequested = false;
   readonly rateLimiter: RateLimitFailsafe;
+  /** Held for this process's lifetime; released in close(). */
+  private writerLock: WriterLockHandle | null = null;
 
   constructor(config: ScraperConfig, log?: Logger) {
     this.config = config;
@@ -162,7 +165,16 @@ export class UserTokenExtractor {
   }
 
   async init(): Promise<void> {
-    await this.storage.init();
+    // Before any storage: a second process must not load its own snapshot of
+    // the metadata file and then race this one to overwrite it.
+    this.writerLock = acquireWriterLock(this.config.dbPath, this.log);
+    try {
+      await this.storage.init();
+    } catch (error) {
+      this.writerLock.release();
+      this.writerLock = null;
+      throw error;
+    }
   }
 
   async validateToken(): Promise<{ valid: boolean; user?: any; error?: string; errorKind?: string }> {
@@ -1015,5 +1027,7 @@ export class UserTokenExtractor {
     this.abortAll();
     this.liveCaptures.clear();
     this.storage.close();
+    this.writerLock?.release();
+    this.writerLock = null;
   }
 }

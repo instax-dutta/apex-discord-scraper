@@ -9,6 +9,8 @@ import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
 
 import { acquireWriterLock, makeWriterLockCleanupError, WriterLockCleanupError, WriterLockError, type WriterLockInfo } from '../src/writerLock.js';
+import { UserTokenExtractor } from '../src/userTokenExtractor.js';
+import type { ScraperConfig } from '../src/types.js';
 import { Logger } from '../src/utils.js';
 
 const quiet = new Logger('error');
@@ -308,4 +310,53 @@ test('cleanup error construction preserves both causes and names the lock path',
   assert.ok(error.message.includes(lockPath));
   assert.equal((error as Error & { cause?: unknown }).cause, writeCause);
   assert.equal(error.cleanupCause, cleanupCause);
+});
+
+function makeConfig(dir: string): ScraperConfig {
+  return {
+    botToken: '',
+    userToken: 'test-token',
+    dbPath: join(dir, 'test.db'),
+    parallelism: 1,
+    chunkSize: 50,
+    pageDelayMs: 0,
+    maxRetries: 1,
+    backoffBaseMs: 1,
+    liveMaxBuffer: 1000,
+    logLevel: 'error',
+    requestsPerSecond: 1000,
+    timeoutMs: 2000,
+    maxBackoffMs: 5,
+    prettyJson: false,
+    balanceShards: false,
+  };
+}
+
+test('a second extractor cannot initialise the same data directory', async () => {
+  const dir = makeTmpDir();
+  const first = new UserTokenExtractor(makeConfig(dir), quiet);
+
+  try {
+    await first.init();
+    assert.ok(existsSync(join(dir, 'test.db.lock')), 'init should take the writer lock');
+
+    const second = new UserTokenExtractor(makeConfig(dir), quiet);
+    await assert.rejects(
+      () => second.init(),
+      (error: unknown) => error instanceof WriterLockError,
+      'a second process must be refused',
+    );
+    // Closing an extractor that never initialised must not throw.
+    second.close();
+
+    first.close();
+    assert.equal(existsSync(join(dir, 'test.db.lock')), false, 'close should release the lock');
+
+    // The directory is usable again once the owner lets go.
+    const third = new UserTokenExtractor(makeConfig(dir), quiet);
+    await third.init();
+    third.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
