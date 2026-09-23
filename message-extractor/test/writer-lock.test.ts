@@ -360,3 +360,31 @@ test('a second extractor cannot initialise the same data directory', async () =>
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('close releases the writer lock when storage cleanup throws', async () => {
+  const dir = makeTmpDir();
+  const lockPath = join(dir, 'test.db.lock');
+  const storageError = new Error('storage close failed');
+  const extractor = new UserTokenExtractor(makeConfig(dir), quiet);
+  let storage: { close(): void } | undefined;
+
+  try {
+    await extractor.init();
+    storage = (extractor as any).storage;
+    (extractor as any).storage = {
+      close() {
+        throw storageError;
+      },
+    };
+
+    assert.throws(
+      () => extractor.close(),
+      (error: unknown) => error === storageError,
+      'close should surface the storage error',
+    );
+    assert.equal(existsSync(lockPath), false, 'cleanup failure must not strand the writer lock');
+  } finally {
+    storage?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

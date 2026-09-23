@@ -1024,10 +1024,14 @@ export class UserTokenExtractor {
   }
 
   close(): void {
-    this.abortAll();
-    this.liveCaptures.clear();
-    this.storage.close();
-    this.writerLock?.release();
-    this.writerLock = null;
+    try {
+      this.abortAll();
+      this.liveCaptures.clear();
+      this.storage.close();
+    } finally {
+      // A cleanup failure must not leave the data directory locked until manual removal.
+      this.writerLock?.release();
+      this.writerLock = null;
+    }
   }
 }
