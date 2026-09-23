@@ -139,6 +139,44 @@ test('a post-init CLI failure releases the writer lock', async () => {
   }
 });
 
+test('the force-unlock override is loaded from .env unless the real environment overrides it', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const lockPath = `${dbPath}.lock`;
+  const envPath = join(process.cwd(), '.env');
+  const originalEnv = existsSync(envPath) ? readFileSync(envPath, 'utf8') : null;
+
+  try {
+    writeFileSync(
+      envPath,
+      `${originalEnv ?? ''}${originalEnv ? '\n' : ''}APEX_SCRAPER_FORCE_UNLOCK=1\n`,
+      'utf8',
+    );
+    writeLock(dbPath, { pid: deadPid(), hostname: hostname(), token: 'stale-file-env-lock' });
+
+    const fromFile = runCli(
+      ['query', 'SELECT 1'],
+      cliEnvironment(dbPath, { APEX_SCRAPER_FORCE_UNLOCK: undefined }),
+    );
+    assert.equal(fromFile.status, 0, fromFile.stderr || fromFile.stdout);
+    assert.equal(existsSync(lockPath), false, '.env override should reclaim and release the stale lock');
+
+    writeLock(dbPath, { pid: deadPid(), hostname: hostname(), token: 'stale-real-env-lock' });
+    const before = readFileSync(lockPath, 'utf8');
+    const fromRealEnv = runCli(
+      ['query', 'SELECT 1'],
+      cliEnvironment(dbPath, { APEX_SCRAPER_FORCE_UNLOCK: '0' }),
+    );
+
+    assert.equal(fromRealEnv.status, 1, fromRealEnv.stderr || fromRealEnv.stdout);
+    assert.equal(readFileSync(lockPath, 'utf8'), before, 'the real environment must win over .env');
+  } finally {
+    if (originalEnv === null) rmSync(envPath, { force: true });
+    else writeFileSync(envPath, originalEnv, 'utf8');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a second writer is refused while the lock is held, and allowed after release', () => {
   const dir = makeTmpDir();
   const dbPath = join(dir, 'test.db');

@@ -41,7 +41,11 @@ function loadFileEnv(): Record<string, string> {
 
 function createEnvResolver(): (key: string) => string | undefined {
   const fileEnv = loadFileEnv();
-  return (key: string) => process.env[key] ?? fileEnv[key];
+  for (const [key, value] of Object.entries(fileEnv)) {
+    // Modules that read process.env directly must observe the same file values.
+    if (process.env[key] === undefined) process.env[key] = value;
+  }
+  return (key: string) => process.env[key];
 }
 
 function parseNumber(value: string | undefined, fallback: number): number {
