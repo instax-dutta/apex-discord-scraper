@@ -318,7 +318,10 @@ export class JsonStorage {
       channelId,
       channelName,
       totalMessages,
-      totalParts: parts.length,
+      // The highest part number, not how many parts exist. `getTail` allocates
+      // `totalParts + 1`, so a count would hand the next append a part number
+      // that a surviving file already uses and overwrite it.
+      totalParts: parts.reduce((max, p) => Math.max(max, p.part), 0),
       extractedAt,
       completedAt,
       parts,
