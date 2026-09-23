@@ -1023,9 +1023,14 @@ export class UserTokenExtractor {
     this.log.info(`Reset all data for channel ${channelId}`);
   }
 
+  /**
+   * Stop admitting work and release the data directory without draining all owned work.
+   * A flush already in flight when this is called can complete after the lock is released.
+   */
   close(): void {
     try {
       this.abortAll();
+      for (const capture of this.liveCaptures) capture.stopAdmitting();
       this.liveCaptures.clear();
       this.storage.close();
     } finally {

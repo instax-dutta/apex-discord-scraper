@@ -12,7 +12,8 @@ import { join } from 'node:path';
 import { Storage } from '../src/storage.js';
 import { acquireWriterLock, makeWriterLockCleanupError, WriterLockCleanupError, WriterLockError, type WriterLockInfo } from '../src/writerLock.js';
 import { UserTokenExtractor } from '../src/userTokenExtractor.js';
-import type { ScraperConfig } from '../src/types.js';
+import type { LiveCapture, LiveMessageSource } from '../src/liveCapture.js';
+import type { DiscordMessage, ScraperConfig } from '../src/types.js';
 import { Logger } from '../src/utils.js';
 
 const quiet = new Logger('error');
@@ -56,6 +57,25 @@ class ThrowingInfoLogger extends Logger {
 class ThrowingWarnLogger extends Logger {
   warn(): void {
     throw new Error('warn logger failure');
+  }
+}
+
+class ControllableLiveSource implements LiveMessageSource {
+  private handler: ((message: DiscordMessage) => void) | null = null;
+  closeCalls = 0;
+
+  onMessage(handler: (message: DiscordMessage) => void): void {
+    this.handler = handler;
+  }
+
+  async start(): Promise<void> {}
+
+  close(): void {
+    this.closeCalls++;
+  }
+
+  emit(message: DiscordMessage): void {
+    this.handler?.(message);
   }
 }
 
@@ -453,6 +473,44 @@ function makeConfig(dir: string): ScraperConfig {
     balanceShards: false,
   };
 }
+
+test('close stops live admission before releasing the writer lock', async () => {
+  const dir = makeTmpDir();
+  const channelId = '123456789012345678';
+  const source = new ControllableLiveSource();
+  const extractor = new UserTokenExtractor(makeConfig(dir), quiet);
+  let capture: LiveCapture | undefined;
+
+  try {
+    await extractor.init();
+    capture = extractor.createLiveCapture(source, {
+      flushIntervalMs: 60_000,
+      batchMessages: 1,
+    });
+    await capture.start([
+      { channelId, channelName: 'channel', guildId: 'guild-1', guildName: 'Guild' },
+    ]);
+
+    extractor.close();
+
+    assert.equal(source.closeCalls, 1, 'close must close the live source synchronously');
+    assert.equal(capture.isRunning(), false, 'close must stop live admission synchronously');
+    source.emit({
+      id: '123456789012345679',
+      channel_id: channelId,
+      content: 'late message',
+      timestamp: new Date().toISOString(),
+      author: { id: 'user-1', username: 'user', discriminator: '0' },
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(capture.getStats()[0]?.sessionMessages, 0, 'a late message was admitted after close');
+    assert.equal(existsSync(join(dir, 'test.db.lock')), false);
+  } finally {
+    if (capture?.isRunning()) await capture.stop();
+    extractor.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('a second extractor cannot initialise the same data directory', async () => {
   const dir = makeTmpDir();

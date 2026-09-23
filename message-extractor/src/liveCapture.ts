@@ -133,6 +133,16 @@ export class LiveCapture {
     return this.running;
   }
 
+  /** Stop timers and the source synchronously without waiting for in-flight flushes. */
+  stopAdmitting(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    this.running = false;
+    this.source.close();
+  }
+
   async start(channels: LiveChannel[]): Promise<void> {
     if (this.running) throw new Error('Live capture is already running');
     if (channels.length === 0) throw new Error('No channels provided for live capture');
@@ -215,13 +225,8 @@ export class LiveCapture {
   }
 
   async stop(): Promise<LiveCaptureSummary> {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-
     // Stop the source first so no new messages arrive during the final flush.
-    this.source.close();
+    this.stopAdmitting();
     await this.flushAll();
     await Promise.allSettled([...this.flushChains.values()]);
 
@@ -299,6 +304,7 @@ export class LiveCapture {
   }
 
   private handleMessage(message: DiscordMessage): void {
+    if (!this.running) return;
     const channelId = message.channel_id;
     if (!channelId) return;
 

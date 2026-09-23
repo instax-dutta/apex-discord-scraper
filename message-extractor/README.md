@@ -353,6 +353,11 @@ Live capture and bulk extraction share one archive: part numbers continue
 where extraction stopped, so a later `--incremental` catch-up picks up exactlywhere live capture left off (and vice versa). `Ctrl-C` flushes everything
 buffered before exiting.
 
+The library-level `UserTokenExtractor.close()` stops live admission synchronously
+and then releases the directory; it is not an asynchronous drain barrier. A flush
+already in flight when it is called can finish after the lock is released. The CLI
+signal path calls `capture.stop()` first so its normal shutdown drains before close.
+
 A capture never writes history twice. Anything at or below the channel's
 stored baseline - the newest id the archive already holds - is dropped, so
 restarting `live`, or a replayed dispatch after a Gateway reconnect, cannot
