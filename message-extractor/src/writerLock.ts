@@ -29,18 +29,11 @@ export interface WriterLockHandle {
   release(): void;
 }
 
-const MAX_ACQUIRE_ATTEMPTS = 3;
 const FORCE_UNLOCK_ENV = 'APEX_SCRAPER_FORCE_UNLOCK';
 
 type PathState =
   | { status: 'missing' }
   | { status: 'present'; holder: WriterLockInfo | null };
-
-type ReclaimReason = 'dead-process' | 'foreign-host-override';
-
-interface GuardHandle {
-  release(): void;
-}
 
 function makeWriterLockInfo(): WriterLockInfo {
   return {
@@ -100,41 +93,20 @@ function readPathState(path: string): PathState {
 }
 
 /**
- * A same-host owner is reclaimable only after liveness proves it is gone.
- * A foreign-host owner can be reclaimed only with the explicit operator override.
+ * The environment override is the only sanctioned way to remove an existing lock.
+ * A same-host owner must be proven dead; a foreign-host owner cannot be probed here.
  */
-function reclaimReason(holder: WriterLockInfo): ReclaimReason | null {
-  if (holder.hostname !== hostname()) {
-    return process.env[FORCE_UNLOCK_ENV] === '1' ? 'foreign-host-override' : null;
-  }
-  return isProcessAlive(holder.pid) ? null : 'dead-process';
+function canForceUnlock(holder: WriterLockInfo | null): boolean {
+  if (!holder || process.env[FORCE_UNLOCK_ENV] !== '1') return false;
+  return holder.hostname !== hostname() || !isProcessAlive(holder.pid);
 }
 
-function reclaimWarning(lockPath: string, holder: WriterLockInfo, reason: ReclaimReason): string {
-  if (reason === 'foreign-host-override') {
-    return (
-      `Reclaiming the writer lock at ${lockPath} by operator override (recorded pid ${holder.pid} ` +
-      `on ${holder.hostname}; cross-host liveness cannot be checked)`
-    );
+function infoSafely(log: Logger | undefined, message: string): void {
+  try {
+    log?.info(message);
+  } catch {
+    // Logging must not strand a successfully created lock.
   }
-  return (
-    `Reclaiming the writer lock at ${lockPath} (recorded pid ${holder.pid} on ` +
-    `${holder.hostname} is no longer running)`
-  );
-}
-
-function heldMessage(lockPath: string, holder: WriterLockInfo | null): string {
-  const who = holder
-    ? ` Another process owns this data directory: pid ${holder.pid} on ${holder.hostname}, ` +
-      `holding it since ${holder.acquiredAt}.`
-    : ' The lock file could not be read, so its owner is unknown.';
-  return (
-    `Another apex-scraper process holds the archive writer lock at ${lockPath}.${who}\n` +
-    'Only one process may write a data directory at a time: concurrent runs overwrite each ' +
-    "other's progress, baselines, and part files. Wait for it to finish, or delete the lock " +
-    `file once you are certain it is gone. Set ${FORCE_UNLOCK_ENV}=1 only when the lock was ` +
-    'created on a different host, where liveness cannot be checked.'
-  );
 }
 
 function warnSafely(log: Logger | undefined, message: string): void {
@@ -145,81 +117,28 @@ function warnSafely(log: Logger | undefined, message: string): void {
   }
 }
 
-function createExclusiveFile(path: string, info: WriterLockInfo): void {
-  const fd = openSync(path, 'wx');
+function writeAndCloseLock(fd: number, lockPath: string, info: WriterLockInfo): void {
+  let closeAttempted = false;
   try {
     writeFileSync(fd, `${JSON.stringify(info)}\n`, { encoding: 'utf8' });
+    closeAttempted = true;
     closeSync(fd);
   } catch (error) {
-    try {
-      closeSync(fd);
-    } catch {
-      // Best effort while preserving the original failure.
+    if (!closeAttempted) {
+      closeAttempted = true;
+      try {
+        closeSync(fd);
+      } catch {
+        // Preserve the original write or close failure.
+      }
     }
     try {
-      unlinkSync(path);
+      unlinkSync(lockPath);
     } catch {
-      // Best effort cleanup of a file that could not be fully written.
+      // The caller receives the failure and no usable handle.
     }
     throw error;
   }
-}
-
-function makeGuardHandle(path: string, token: string, log?: Logger): GuardHandle {
-  let released = false;
-  return {
-    release() {
-      if (released) return;
-      released = true;
-      try {
-        const state = readPathState(path);
-        if (state.status !== 'present' || state.holder?.token !== token) return;
-        unlinkSync(path);
-      } catch (error: any) {
-        if (error?.code !== 'ENOENT') {
-          warnSafely(log, `Could not remove the writer lock guard at ${path}: ${error?.message ?? error}`);
-        }
-      }
-    },
-  };
-}
-
-function acquireGuard(path: string, log?: Logger): GuardHandle {
-  const info = makeWriterLockInfo();
-
-  for (let attempt = 0; attempt < MAX_ACQUIRE_ATTEMPTS; attempt++) {
-    try {
-      createExclusiveFile(path, info);
-      try {
-        log?.info(`Acquired the archive writer lock guard at ${path}`);
-      } catch {
-        // Logging must not prevent a successfully held guard from being used.
-      }
-      return makeGuardHandle(path, info.token, log);
-    } catch (error: any) {
-      if (error?.code !== 'EEXIST') throw error;
-
-      const state = readPathState(path);
-      if (state.status === 'missing') continue;
-      if (state.holder && state.holder.hostname === hostname() && !isProcessAlive(state.holder.pid)) {
-        warnSafely(
-          log,
-          `Reclaiming the writer lock guard at ${path} (recorded pid ${state.holder.pid} on ` +
-            `${state.holder.hostname} is no longer running)`,
-        );
-        try {
-          unlinkSync(path);
-        } catch (unlinkError: any) {
-          if (unlinkError?.code !== 'ENOENT') throw unlinkError;
-        }
-        continue;
-      }
-    }
-  }
-
-  const state = readPathState(path);
-  const holder = state.status === 'present' ? state.holder : null;
-  throw new WriterLockError(heldMessage(path, holder), path, holder);
 }
 
 function makeWriterLockHandle(lockPath: string, token: string, log?: Logger): WriterLockHandle {
@@ -229,9 +148,7 @@ function makeWriterLockHandle(lockPath: string, token: string, log?: Logger): Wr
     release() {
       if (released) return;
       released = true;
-      let guard: GuardHandle | null = null;
       try {
-        guard = acquireGuard(`${lockPath}.guard`, log);
         const state = readPathState(lockPath);
         if (state.status !== 'present' || state.holder?.token !== token) return;
         unlinkSync(lockPath);
@@ -239,56 +156,55 @@ function makeWriterLockHandle(lockPath: string, token: string, log?: Logger): Wr
         if (error?.code !== 'ENOENT') {
           warnSafely(log, `Could not remove the writer lock at ${lockPath}: ${error?.message ?? error}`);
         }
-      } finally {
-        try {
-          guard?.release();
-        } catch {
-          // Guard cleanup is best effort and must not make release throw.
-        }
       }
     },
   };
 }
 
-function acquireWithGuard(lockPath: string, info: WriterLockInfo, log?: Logger): WriterLockHandle {
-  for (let attempt = 0; attempt < MAX_ACQUIRE_ATTEMPTS; attempt++) {
-    const state = readPathState(lockPath);
-    if (state.status === 'missing') {
-      try {
-        createExclusiveFile(lockPath, info);
-        log?.info(`Acquired the archive writer lock at ${lockPath}`);
-        return makeWriterLockHandle(lockPath, info.token, log);
-      } catch (error: any) {
-        if (error?.code === 'EEXIST') continue;
-        throw error;
-      }
-    }
+function heldMessage(lockPath: string, holder: WriterLockInfo | null): string {
+  const owner = holder
+    ? ` The recorded owner is pid ${holder.pid} on ${holder.hostname}, holding it since ${holder.acquiredAt}.`
+    : ' The lock file could not be read, so its owner is unknown.';
+  const guidance = holder
+    ? `Wait for the recorded owner to finish. If you are certain it is gone, delete the lock file or set ` +
+      `${FORCE_UNLOCK_ENV}=1 and retry; the override accepts the risk of racing another writer.`
+    : 'Identify the owner and wait for it to finish. If you are certain it is gone, delete the lock file; ' +
+      'the force override cannot establish ownership from an unreadable file.';
+  return (
+    `Only one process may write a data directory at a time. The archive writer lock at ${lockPath} is held and will not be taken automatically.${owner}\n` +
+    guidance
+  );
+}
 
-    const holder = state.holder;
-    const reason = holder ? reclaimReason(holder) : null;
-    if (holder && reason) {
-      warnSafely(log, reclaimWarning(lockPath, holder, reason));
-      try {
-        unlinkSync(lockPath);
-      } catch (error: any) {
-        if (error?.code !== 'ENOENT') throw error;
-      }
-      try {
-        createExclusiveFile(lockPath, info);
-        log?.info(`Acquired the archive writer lock at ${lockPath}`);
-        return makeWriterLockHandle(lockPath, info.token, log);
-      } catch (error: any) {
-        if (error?.code === 'EEXIST') continue;
-        throw error;
-      }
-    }
+function completeLock(fd: number, lockPath: string, info: WriterLockInfo, log?: Logger): WriterLockHandle {
+  writeAndCloseLock(fd, lockPath, info);
+  infoSafely(log, `Acquired the archive writer lock at ${lockPath}`);
+  return makeWriterLockHandle(lockPath, info.token, log);
+}
 
+function acquireExistingLock(lockPath: string, info: WriterLockInfo, log?: Logger): WriterLockHandle {
+  const state = readPathState(lockPath);
+  const holder = state.status === 'present' ? state.holder : null;
+  if (!canForceUnlock(holder)) {
     throw new WriterLockError(heldMessage(lockPath, holder), lockPath, holder);
   }
 
-  const state = readPathState(lockPath);
-  const holder = state.status === 'present' ? state.holder : null;
-  throw new WriterLockError(heldMessage(lockPath, holder), lockPath, holder);
+  try {
+    unlinkSync(lockPath);
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+
+  let fd: number;
+  try {
+    fd = openSync(lockPath, 'wx');
+  } catch (error: any) {
+    if (error?.code !== 'EEXIST') throw error;
+    const currentState = readPathState(lockPath);
+    const currentHolder = currentState.status === 'present' ? currentState.holder : null;
+    throw new WriterLockError(heldMessage(lockPath, currentHolder), lockPath, currentHolder);
+  }
+  return completeLock(fd, lockPath, info, log);
 }
 
 /**
@@ -297,27 +213,21 @@ function acquireWithGuard(lockPath: string, info: WriterLockInfo, log?: Logger):
  * The SQLite metadata file is loaded once per process and rewritten whole, and the
  * JSON archive keeps its part numbering in memory. Two processes writing the same
  * directory therefore clobber each other's state with no error. The lock file is
- * created with O_EXCL, which is atomic, and is only reclaimed when its owner is
- * provably gone. Contended acquisition and token-bound release use a short-lived
- * guard file to serialize the revalidation, replacement, and removal operations.
+ * created with O_EXCL, which is atomic. If it already exists, the lock is never
+ * taken automatically; liveness is reported to the operator instead. The environment
+ * variable is an explicit operator override that accepts the risk of a race.
  */
 export function acquireWriterLock(dbPath: string, log?: Logger): WriterLockHandle {
   const lockPath = `${dbPath}.lock`;
+  readPathState(lockPath);
   const info = makeWriterLockInfo();
 
+  let fd: number;
   try {
-    createExclusiveFile(lockPath, info);
-    log?.info(`Acquired the archive writer lock at ${lockPath}`);
-    return makeWriterLockHandle(lockPath, info.token, log);
+    fd = openSync(lockPath, 'wx');
   } catch (error: any) {
     if (error?.code !== 'EEXIST') throw error;
-    readPathState(lockPath);
+    return acquireExistingLock(lockPath, info, log);
   }
-
-  const guard = acquireGuard(`${lockPath}.guard`, log);
-  try {
-    return acquireWithGuard(lockPath, info, log);
-  } finally {
-    guard.release();
-  }
+  return completeLock(fd, lockPath, info, log);
 }

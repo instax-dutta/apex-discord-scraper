@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, unlinkSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
 
@@ -12,6 +12,18 @@ import { acquireWriterLock, WriterLockError, type WriterLockInfo } from '../src/
 import { Logger } from '../src/utils.js';
 
 const quiet = new Logger('error');
+
+class ThrowingInfoLogger extends Logger {
+  info(): void {
+    throw new Error('info logger failure');
+  }
+}
+
+class ThrowingWarnLogger extends Logger {
+  warn(): void {
+    throw new Error('warn logger failure');
+  }
+}
 
 function makeTmpDir(): string {
   return mkdtempSync(join(tmpdir(), 'apex-lock-'));
@@ -87,18 +99,28 @@ test('release is idempotent and a released lock can be taken again', () => {
   }
 });
 
-test('a lock left behind by a dead process on this host is reclaimed', () => {
+test('a dead same-host lock is not automatically reclaimed', () => {
   const dir = makeTmpDir();
   const dbPath = join(dir, 'test.db');
+  const dead = deadPid();
+  const previous = process.env.APEX_SCRAPER_FORCE_UNLOCK;
+  delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
 
   try {
-    writeLock(dbPath, { pid: deadPid(), hostname: hostname() });
-
-    const handle = acquireWriterLock(dbPath, quiet);
-    const info = JSON.parse(readFileSync(handle.path, 'utf-8')) as WriterLockInfo;
-    assert.equal(info.pid, process.pid, 'the reclaimed lock should name this process');
-    handle.release();
+    writeLock(dbPath, { pid: dead, hostname: hostname(), token: 'stale-lock' });
+    assert.throws(
+      () => acquireWriterLock(dbPath, quiet),
+      (error: unknown) => {
+        assert.ok(error instanceof WriterLockError, 'expected a WriterLockError');
+        assert.equal(error.holder?.pid, dead);
+        assert.match(error.message, /will not be taken automatically/);
+        assert.match(error.message, /APEX_SCRAPER_FORCE_UNLOCK=1/);
+        return true;
+      },
+    );
   } finally {
+    if (previous === undefined) delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+    else process.env.APEX_SCRAPER_FORCE_UNLOCK = previous;
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -133,7 +155,7 @@ test('lock ownership is bound to its token across reacquisition', () => {
   try {
     const first = acquireWriterLock(dbPath, quiet);
     const firstInfo = JSON.parse(readFileSync(first.path, 'utf-8')) as WriterLockInfo;
-    writeLock(dbPath, { pid: deadPid(), hostname: hostname(), token: firstInfo.token });
+    unlinkSync(first.path);
 
     const second = acquireWriterLock(dbPath, quiet);
     const secondInfo = JSON.parse(readFileSync(second.path, 'utf-8')) as WriterLockInfo;
@@ -180,29 +202,69 @@ test('a directory at the lock path surfaces as a filesystem error', () => {
   }
 });
 
-test('a contended reclaim leaves no takeover guard behind', () => {
+test('the override does not bypass a live same-host lock', () => {
   const dir = makeTmpDir();
   const dbPath = join(dir, 'test.db');
-  const guardPath = `${dbPath}.lock.guard`;
+  const previous = process.env.APEX_SCRAPER_FORCE_UNLOCK;
+  process.env.APEX_SCRAPER_FORCE_UNLOCK = '1';
 
   try {
-    const dead = deadPid();
-    writeLock(dbPath, { pid: dead, hostname: hostname(), token: 'stale-lock' });
-    writeFileSync(
-      guardPath,
-      `${JSON.stringify({
-        pid: dead,
-        hostname: hostname(),
-        acquiredAt: new Date().toISOString(),
-        command: 'test',
-        token: 'stale-guard',
-      })}\n`,
-      'utf-8',
-    );
-
     const handle = acquireWriterLock(dbPath, quiet);
-    assert.equal(existsSync(guardPath), false, 'the takeover guard must be released');
+    assert.throws(() => acquireWriterLock(dbPath, quiet), WriterLockError);
     handle.release();
+  } finally {
+    if (previous === undefined) delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+    else process.env.APEX_SCRAPER_FORCE_UNLOCK = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the override reclaims a dead same-host lock', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const previous = process.env.APEX_SCRAPER_FORCE_UNLOCK;
+  process.env.APEX_SCRAPER_FORCE_UNLOCK = '1';
+  const dead = deadPid();
+
+  try {
+    writeLock(dbPath, { pid: dead, hostname: hostname(), token: 'stale-lock' });
+    const handle = acquireWriterLock(dbPath, quiet);
+    const info = JSON.parse(readFileSync(handle.path, 'utf-8')) as WriterLockInfo;
+    assert.notEqual(info.token, 'stale-lock');
+    handle.release();
+    assert.equal(existsSync(handle.path), false);
+  } finally {
+    if (previous === undefined) delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+    else process.env.APEX_SCRAPER_FORCE_UNLOCK = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a throwing info logger cannot strand a lock', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const log = new ThrowingInfoLogger('error');
+
+  try {
+    const handle = acquireWriterLock(dbPath, log);
+    assert.ok(existsSync(handle.path));
+    handle.release();
+    assert.equal(existsSync(handle.path), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a throwing warn logger cannot escape release', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const log = new ThrowingWarnLogger('error');
+
+  try {
+    const handle = acquireWriterLock(dbPath, log);
+    rmSync(handle.path, { force: true });
+    mkdirSync(handle.path);
+    assert.doesNotThrow(() => handle.release());
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
