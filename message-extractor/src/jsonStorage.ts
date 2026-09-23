@@ -286,11 +286,18 @@ export class JsonStorage {
 
     const parts: JsonPartMeta[] = [];
     let totalMessages = 0;
+    let totalParts = 0;
     let channelName = channelId;
     let extractedAt = new Date().toISOString();
     let completedAt: string | null = null;
 
     for (const filename of chunkFiles) {
+      // Skipped files still reserve their part numbers: their bytes are on disk and
+      // must never be overwritten by a later append.
+      const match = /-(\d{6,})\.json$/.exec(filename);
+      const candidatePart = match ? Number(match[1]) : 0;
+      if (Number.isSafeInteger(candidatePart)) totalParts = Math.max(totalParts, candidatePart);
+
       const read = this.readPart(channelId, filename);
       if (!read || typeof read.chunk.part !== 'number') {
         this.log.warn(`Skipping unreadable chunk ${filename}`);
@@ -312,6 +319,7 @@ export class JsonStorage {
         open: read.open,
       });
       totalMessages += chunk.messageCount;
+      totalParts = Math.max(totalParts, chunk.part);
     }
 
     parts.sort((a, b) => a.part - b.part);
@@ -323,7 +331,7 @@ export class JsonStorage {
       // The highest part number, not how many parts exist. `getTail` allocates
       // `totalParts + 1`, so a count would hand the next append a part number
       // that a surviving file already uses and overwrite it.
-      totalParts: parts.reduce((max, p) => Math.max(max, p.part), 0),
+      totalParts,
       extractedAt,
       completedAt,
       parts,
@@ -552,8 +560,9 @@ export class JsonStorage {
 
     archive.totalMessages = Math.max(0, archive.totalMessages - archive.parts[index].messageCount);
     archive.parts.splice(index, 1);
-    archive.totalParts = archive.parts.reduce((max, p) => Math.max(max, p.part), 0);
-  }  /** Upper bound on a channel's duplicate guard, in ids. */
+  }
+
+  /** Upper bound on a channel's duplicate guard, in ids. */
   private get guardLimit(): number {
     const budget = Math.max(1, this.maxDedupIds);
     return this.exactDedup ? budget : Math.min(budget, this.dedupParts * this.chunkSize);
@@ -865,17 +874,27 @@ export class JsonStorage {
     if (!existsSync(filepath)) return null;
 
     const text = readFileSync(filepath, 'utf-8');
+    let value: unknown;
     try {
-      const chunk = JSON.parse(text) as JsonChunk;
-      if (Array.isArray(chunk.messages)) return { chunk, open: false };
+      value = JSON.parse(text);
     } catch {
       // Not a single JSON value, so it is an open JSON-Lines part.
+      const chunk = this.parseOpenPart(text, filename);
+      return chunk ? { chunk, open: true } : null;
     }
 
-    // A header-only open part parses as JSON but carries no message array;
-    // `parseOpenPart` normalises it to an empty message list.
-    const chunk = this.parseOpenPart(text, filename);
-    return chunk ? { chunk, open: true } : null;
+    if (!value || typeof value !== 'object') return null;
+    const chunk = value as Partial<JsonChunk> & { open?: boolean };
+    if (Array.isArray(chunk.messages)) return { chunk: chunk as JsonChunk, open: false };
+
+    // A header-only part parses as a single JSON value, so its shape is the only
+    // thing that tells it apart from a corrupt one.
+    if (chunk.open === true && typeof chunk.part === 'number') {
+      const header = this.parseOpenPart(text, filename);
+      return header ? { chunk: header, open: true } : null;
+    }
+
+    return null;
   }
 
   /** Read one part. A completed chunk is a single JSON value; an open part is JSON Lines. */

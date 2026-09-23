@@ -3,7 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, unlinkSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -80,6 +80,78 @@ test('a rebuilt manifest counts the highest part number, not the number of parts
       stored.sort((a, b) => Number(a) - Number(b)),
       rows(1, 10).concat(rows(21, 10)).concat(rows(31, 5)).map((r) => r.id),
       'recovered messages were lost or duplicated',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a rebuilt manifest reserves an unreadable higher-numbered part', () => {
+  const dir = makeTmpDir();
+  const base = join(dir, 'json');
+  const skippedPath = join(base, 'c1', 'chan-000004.json');
+  const skippedBytes = 'not-json\n';
+
+  try {
+    const first = new JsonStorage(base, quiet, { chunkSize: 10 });
+    first.appendMessages('c1', 'chan', rows(1, 10));
+    first.finalizeChannel('c1');
+    writeFileSync(skippedPath, skippedBytes, 'utf-8');
+    unlinkSync(join(base, 'c1', '_archive.json'));
+
+    const second = new JsonStorage(base, quiet, { chunkSize: 10 });
+    const rebuilt = second.loadArchive('c1');
+    assert.ok(rebuilt, 'archive was not rebuilt');
+    assert.deepEqual(rebuilt!.parts.map((part) => part.part), [1]);
+    assert.equal(rebuilt!.totalParts, 4, 'the unreadable part number was not reserved');
+
+    second.appendMessages('c1', 'chan', rows(11, 10));
+
+    const archive = second.loadArchive('c1')!;
+    assert.deepEqual(archive.parts.map((part) => part.part), [1, 5]);
+    assert.equal(archive.totalParts, 5);
+    assert.equal(readFileSync(skippedPath, 'utf-8'), skippedBytes);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a gap before an open part does not lower the high-water mark', () => {
+  const dir = makeTmpDir();
+  const base = join(dir, 'json');
+
+  try {
+    const first = new JsonStorage(base, quiet, { chunkSize: 10 });
+    first.appendMessages('c1', 'chan', rows(1, 10));
+    first.finalizeChannel('c1');
+    writeFileSync(
+      join(base, 'c1', 'chan-000003.json'),
+      `${JSON.stringify({
+        channelId: 'c1',
+        channelName: 'chan',
+        part: 3,
+        open: true,
+        startedAt: new Date().toISOString(),
+      })}\n`,
+      'utf-8',
+    );
+    unlinkSync(join(base, 'c1', '_archive.json'));
+
+    const second = new JsonStorage(base, quiet, { chunkSize: 10 });
+    const rebuilt = second.loadArchive('c1');
+    assert.ok(rebuilt, 'archive was not rebuilt');
+    assert.deepEqual(rebuilt!.parts.map((part) => part.part), [1, 3]);
+    assert.equal(rebuilt!.totalParts, 3);
+    assert.equal(rebuilt!.parts[1].open, true);
+
+    second.appendMessages('c1', 'chan', rows(11, 10));
+
+    const archive = second.loadArchive('c1')!;
+    assert.deepEqual(archive.parts.map((part) => part.part), [1, 4]);
+    assert.equal(archive.totalParts, 4, 'sealing the empty open part lowered the high-water mark');
+    assert.deepEqual(
+      second.loadAllMessages('c1').map((message) => message.id),
+      rows(1, 20).map((row) => row.id),
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
