@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
 
@@ -33,6 +33,7 @@ function writeLock(dbPath: string, info: Partial<WriterLockInfo>): string {
       hostname: hostname(),
       acquiredAt: new Date().toISOString(),
       command: 'test',
+      token: 'test-token',
       ...info,
     })}\n`,
     'utf-8',
@@ -107,10 +108,11 @@ test('a lock from another host needs the explicit override', () => {
   const dbPath = join(dir, 'test.db');
   const previous = process.env.APEX_SCRAPER_FORCE_UNLOCK;
   delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+  const otherHost = hostname() === 'some-other-host' ? 'some-other-host-2' : 'some-other-host';
 
   try {
     // Liveness cannot be checked across hosts, so the lock is respected.
-    writeLock(dbPath, { pid: 4242, hostname: 'some-other-host' });
+    writeLock(dbPath, { pid: 4242, hostname: otherHost });
     assert.throws(() => acquireWriterLock(dbPath, quiet), WriterLockError);
 
     // The override is the only way past it.
@@ -120,6 +122,88 @@ test('a lock from another host needs the explicit override', () => {
   } finally {
     if (previous === undefined) delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
     else process.env.APEX_SCRAPER_FORCE_UNLOCK = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('lock ownership is bound to its token across reacquisition', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+
+  try {
+    const first = acquireWriterLock(dbPath, quiet);
+    const firstInfo = JSON.parse(readFileSync(first.path, 'utf-8')) as WriterLockInfo;
+    writeLock(dbPath, { pid: deadPid(), hostname: hostname(), token: firstInfo.token });
+
+    const second = acquireWriterLock(dbPath, quiet);
+    const secondInfo = JSON.parse(readFileSync(second.path, 'utf-8')) as WriterLockInfo;
+
+    first.release();
+    assert.equal(existsSync(second.path), true, 'an old handle must not release a successor lock');
+    assert.notEqual(secondInfo.token, firstInfo.token, 'a new acquisition needs a new ownership token');
+    second.release();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the holder file contains the ownership token', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+
+  try {
+    const handle = acquireWriterLock(dbPath, quiet);
+    const info = JSON.parse(readFileSync(handle.path, 'utf-8')) as WriterLockInfo;
+    assert.match(info.token, /^[0-9a-f]{32}$/);
+    handle.release();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a directory at the lock path surfaces as a filesystem error', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  mkdirSync(`${dbPath}.lock`);
+
+  try {
+    assert.throws(
+      () => acquireWriterLock(dbPath, quiet),
+      (error: unknown) => {
+        assert.ok(!(error instanceof WriterLockError));
+        assert.match((error as Error).message, /not a regular file|directory/i);
+        return true;
+      },
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a contended reclaim leaves no takeover guard behind', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const guardPath = `${dbPath}.lock.guard`;
+
+  try {
+    const dead = deadPid();
+    writeLock(dbPath, { pid: dead, hostname: hostname(), token: 'stale-lock' });
+    writeFileSync(
+      guardPath,
+      `${JSON.stringify({
+        pid: dead,
+        hostname: hostname(),
+        acquiredAt: new Date().toISOString(),
+        command: 'test',
+        token: 'stale-guard',
+      })}\n`,
+      'utf-8',
+    );
+
+    const handle = acquireWriterLock(dbPath, quiet);
+    assert.equal(existsSync(guardPath), false, 'the takeover guard must be released');
+    handle.release();
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
