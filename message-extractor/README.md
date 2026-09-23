@@ -1082,6 +1082,15 @@ docker run -v $(pwd)/data:/app/data -e DISCORD_USER_TOKEN=your_token apex-scrape
 
 ## Limitations
 
+- **One process per data directory**: `extract`, `live`, and `watch` all take an exclusive lock on
+  `<DB_PATH>.lock`, so a second run against the same `DB_PATH` stops immediately instead of
+  corrupting the archive. An existing lock is never taken or reclaimed automatically, even if its
+  recorded process has died. Without the override, the error reports the recorded pid, host, and
+  acquisition time but does not probe liveness. If you have verified that no writer is active,
+  remove the lock file manually or set `APEX_SCRAPER_FORCE_UNLOCK=1` and retry; the override
+  explicitly accepts the risk of racing another writer. If the lock file cannot be read, its owner
+  is unknown and the override cannot establish ownership, so remove it manually only after
+  identifying the owner. The `query` command does not take the lock.
 - **Access limited to your permissions**: You can only extract channels you can already read in Discord.
 - **History starts when you joined**: Discord only serves message history from the point you
   gained access to the channel. No tool can retrieve what was there before you could see it -
