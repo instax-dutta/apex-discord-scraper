@@ -199,6 +199,52 @@ export function resolveSegments(
   return { segments, state: createResumeState(segments, parallelism, freshBalance ?? null) };
 }
 
+export type IncrementalWindowReason = 'ok' | 'no-baseline' | 'pending-shards';
+
+export interface IncrementalWindowDecision {
+  /** True when this run may use a single catch-up window instead of the saved layout. */
+  useIncrementalWindow: boolean;
+  /** True when the saved state is itself that catch-up window and should be resumed as-is. */
+  reuseSavedWindow: boolean;
+  reason: IncrementalWindowReason;
+}
+
+/**
+ * Decide whether a catch-up window may replace the saved shard layout.
+ *
+ * A one-segment window only covers messages newer than the baseline. Applying it
+ * to a layout that still has pending shards silently discards those shards'
+ * windows, so the channel would finish as `done` with a permanent hole in its
+ * history. Two states are safe: every shard is done (the normal catch-up after a
+ * completed run), or the saved state is a single segment whose lower bound is the
+ * baseline - that is a previous catch-up resuming after a failure, not a lost
+ * multi-shard layout.
+ */
+export function decideIncrementalWindow(
+  baseline: string | null,
+  savedState: ChannelResumeState | null,
+): IncrementalWindowDecision {
+  if (!baseline) {
+    return { useIncrementalWindow: false, reuseSavedWindow: false, reason: 'no-baseline' };
+  }
+
+  if (
+    savedState &&
+    savedState.parallelism === 1 &&
+    savedState.segments.length === 1 &&
+    savedState.segments[0].after === baseline &&
+    !savedState.segments[0].done
+  ) {
+    return { useIncrementalWindow: true, reuseSavedWindow: true, reason: 'ok' };
+  }
+
+  if (!savedState || isResumeComplete(savedState)) {
+    return { useIncrementalWindow: true, reuseSavedWindow: false, reason: 'ok' };
+  }
+
+  return { useIncrementalWindow: false, reuseSavedWindow: false, reason: 'pending-shards' };
+}
+
 export function getSegmentState(
   state: ChannelResumeState,
   index: number,

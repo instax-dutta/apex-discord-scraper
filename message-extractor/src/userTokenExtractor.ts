@@ -37,6 +37,7 @@ import {
   buildBalance,
   cloneResumeState,
   createResumeState,
+  decideIncrementalWindow,
   describeResumeState,
   hasReusableWindows,
   isResumeComplete,
@@ -303,17 +304,12 @@ export class UserTokenExtractor {
     let liveResumeState: ChannelResumeState;
 
     const baseline = wantIncremental ? (since ?? progress.newest_message_id ?? null) : null;
+    const incrementalDecision = wantIncremental
+      ? decideIncrementalWindow(baseline, savedState)
+      : null;
 
-    if (wantIncremental && baseline) {
-      const reusable =
-        !!savedState &&
-        savedState.parallelism === 1 &&
-        savedState.segments.length === 1 &&
-        savedState.segments[0].after === baseline &&
-        savedState.segments[0].before.length > 0 &&
-        !savedState.segments[0].done;
-
-      if (reusable) {
+    if (incrementalDecision?.useIncrementalWindow && baseline) {
+      if (incrementalDecision.reuseSavedWindow) {
         segments = [{ after: savedState!.segments[0].after, before: savedState!.segments[0].before }];
         liveResumeState = savedState!;
       } else {
@@ -323,10 +319,16 @@ export class UserTokenExtractor {
 
       this.log.info(`Incremental catch-up for ${channelId} since message ${baseline}`);
     } else {
-      if (wantIncremental && !baseline) {
+      if (incrementalDecision?.reason === 'no-baseline') {
         this.log.warn(
           `Incremental catch-up requested for ${channelName} but no previous extraction ` +
-          `baseline was found; performing a full extraction instead.`,
+            `baseline was found; performing a full extraction instead.`,
+        );
+      } else if (incrementalDecision?.reason === 'pending-shards') {
+        this.log.warn(
+          `${channelName} has shards left pending from an interrupted run; ` +
+            `resuming the full extraction instead of a catch-up so the unfinished ` +
+            `windows are not skipped.`,
         );
       }
 
