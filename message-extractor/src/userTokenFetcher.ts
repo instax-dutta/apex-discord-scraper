@@ -48,6 +48,23 @@ function isAborted(error: unknown): boolean {
 }
 
 /**
+ * Refuse a page that does not move the cursor.
+ *
+ * Discord answering `before=X` with the same page twice would otherwise leave
+ * `before` unchanged and spin forever, holding the extraction open with no
+ * progress and no error. The first page is always allowed through; only a
+ * repeat of a cursor we have already seen is a stall.
+ */
+function assertCursorAdvanced(oldest: string, lastOldest: string | null): void {
+  if (lastOldest !== null && BigInt(oldest) >= BigInt(lastOldest)) {
+    throw new ExtractorError('Pagination cursor stalled (Discord returned the same page)', {
+      kind: 'unknown',
+      retryable: false,
+    });
+  }
+}
+
+/**
  * The span a last-resort sequential sweep has to cover: from the earliest
  * pending shard's lower bound up to the highest cursor the pending shards
  * reached.
@@ -235,13 +252,7 @@ export class UserTokenFetcher {
           });
         }
 
-        // No-progress guard: if the cursor does not move we would spin forever.
-        if (pages > 0 && lastOldest !== null && BigInt(oldest) >= BigInt(lastOldest)) {
-          throw new ExtractorError('Pagination cursor stalled (Discord returned the same page)', {
-            kind: 'unknown',
-            retryable: false,
-          });
-        }
+        assertCursorAdvanced(oldest, lastOldest);
         lastOldest = oldest;
         setSegmentCursor(state, index, oldest);
 
@@ -283,6 +294,7 @@ export class UserTokenFetcher {
   ): Promise<{ fetched: number; completed: boolean; error?: Error }> {
     const afterBound = BigInt(window.after);
     let before: string | undefined = window.before;
+    let lastOldest: string | null = null;
     let fetched = 0;
 
     try {
@@ -311,6 +323,8 @@ export class UserTokenFetcher {
         }
 
         const oldest = messages[messages.length - 1].id;
+        assertCursorAdvanced(oldest, lastOldest);
+        lastOldest = oldest;
         if (BigInt(oldest) <= afterBound) {
           return { fetched, completed: true };
         }
