@@ -3,11 +3,12 @@
 
 import { mock, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import fs, { mkdtempSync, mkdirSync, rmSync, unlinkSync, symlinkSync, writeFileSync, existsSync, readFileSync } from 'fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { Storage } from '../src/storage.js';
 import { acquireWriterLock, makeWriterLockCleanupError, WriterLockCleanupError, WriterLockError, type WriterLockInfo } from '../src/writerLock.js';
@@ -46,6 +47,62 @@ function runCli(args: string[], env: NodeJS.ProcessEnv) {
   });
   assert.ifError(result.error);
   return result;
+}
+
+function waitForChildMessage(child: ChildProcess, expected: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timed out waiting for child message ${expected}`));
+    }, 10_000);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      child.off('message', onMessage);
+      child.off('error', onError);
+      child.off('exit', onExit);
+    };
+    const onMessage = (message: unknown) => {
+      if (message !== expected) return;
+      cleanup();
+      resolve();
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      reject(new Error(`Lock holder exited before sending ${expected} (code=${code}, signal=${signal})`));
+    };
+    child.on('message', onMessage);
+    child.once('error', onError);
+    child.once('exit', onExit);
+  });
+}
+
+function waitForChildExit(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('Timed out waiting for lock holder to exit'));
+    }, 10_000);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      child.off('error', onError);
+      child.off('exit', onExit);
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onExit = () => {
+      cleanup();
+      resolve();
+    };
+    child.once('error', onError);
+    child.once('exit', onExit);
+  });
 }
 
 class ThrowingInfoLogger extends Logger {
@@ -129,6 +186,69 @@ test('query is refused while another process owns the writer lock', () => {
   }
 });
 
+test('an independent process can hold the lock and refuse the parent', async () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const lockPath = `${dbPath}.lock`;
+  const writerModule = pathToFileURL(join(process.cwd(), 'src', 'writerLock.ts')).href;
+  const childScript = `
+    (async () => {
+      const { acquireWriterLock } = await import(${JSON.stringify(writerModule)});
+      const handle = acquireWriterLock(process.env.LOCK_PATH);
+      process.send?.('locked');
+      process.on('message', (message) => {
+        if (message === 'release') {
+          handle.release();
+          process.exit(0);
+        }
+      });
+    })();
+  `;
+  const previousOverride = process.env.APEX_SCRAPER_FORCE_UNLOCK;
+  delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+  const child = spawn(process.execPath, [tsxCli, '-e', childScript], {
+    cwd: process.cwd(),
+    env: cliEnvironment(dbPath, {
+      APEX_SCRAPER_FORCE_UNLOCK: undefined,
+      LOCK_PATH: dbPath,
+    }),
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+  let childError = '';
+  child.stderr?.on('data', (chunk) => {
+    childError += String(chunk);
+  });
+
+  try {
+    await waitForChildMessage(child, 'locked');
+    const before = readFileSync(lockPath, 'utf8');
+    assert.throws(
+      () => acquireWriterLock(dbPath, quiet),
+      (error: unknown) => {
+        assert.ok(error instanceof WriterLockError);
+        assert.equal(typeof error.holder?.pid, 'number');
+        assert.notEqual(error.holder?.pid, process.pid);
+        return true;
+      },
+    );
+    assert.equal(existsSync(lockPath), true, 'the parent must not remove the child lock');
+    assert.equal(readFileSync(lockPath, 'utf8'), before, 'the parent must not replace the child lock');
+
+    child.send('release');
+    await waitForChildExit(child);
+    assert.equal(existsSync(lockPath), false, 'the child should remove its lock on release');
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGTERM');
+      await waitForChildExit(child).catch(() => undefined);
+    }
+    if (previousOverride === undefined) delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+    else process.env.APEX_SCRAPER_FORCE_UNLOCK = previousOverride;
+    rmSync(dir, { recursive: true, force: true });
+    assert.equal(childError.includes('Unhandled'), false, childError);
+  }
+});
+
 test('a post-init CLI failure releases the writer lock', async () => {
   const dir = makeTmpDir();
   const dbPath = join(dir, 'test.db');
@@ -205,6 +325,7 @@ test('a second writer is refused while the lock is held, and allowed after relea
     const first = acquireWriterLock(dbPath, quiet);
     assert.equal(first.path, `${dbPath}.lock`);
     assert.ok(existsSync(first.path), 'the lock file should exist while held');
+    const before = readFileSync(first.path, 'utf8');
 
     assert.throws(
       () => acquireWriterLock(dbPath, quiet),
@@ -216,6 +337,8 @@ test('a second writer is refused while the lock is held, and allowed after relea
         return true;
       },
     );
+    assert.equal(existsSync(first.path), true, 'the refusal must leave the lock in place');
+    assert.equal(readFileSync(first.path, 'utf8'), before, 'the refusal must not replace the lock');
 
     first.release();
     assert.equal(existsSync(first.path), false, 'release must remove the lock file');
@@ -251,7 +374,8 @@ test('a dead same-host lock is not automatically reclaimed', () => {
   delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
 
   try {
-    writeLock(dbPath, { pid: dead, hostname: hostname(), token: 'stale-lock' });
+    const lockPath = writeLock(dbPath, { pid: dead, hostname: hostname(), token: 'stale-lock' });
+    const before = readFileSync(lockPath, 'utf8');
     assert.throws(
       () => acquireWriterLock(dbPath, quiet),
       (error: unknown) => {
@@ -262,6 +386,8 @@ test('a dead same-host lock is not automatically reclaimed', () => {
         return true;
       },
     );
+    assert.equal(existsSync(lockPath), true, 'the refusal must leave the stale lock in place');
+    assert.equal(readFileSync(lockPath, 'utf8'), before, 'the refusal must not replace the stale lock');
   } finally {
     if (previous === undefined) delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
     else process.env.APEX_SCRAPER_FORCE_UNLOCK = previous;
@@ -278,8 +404,11 @@ test('a lock from another host needs the explicit override', () => {
 
   try {
     // Liveness cannot be checked across hosts, so the lock is respected.
-    writeLock(dbPath, { pid: 4242, hostname: otherHost });
+    const lockPath = writeLock(dbPath, { pid: 4242, hostname: otherHost });
+    const before = readFileSync(lockPath, 'utf8');
     assert.throws(() => acquireWriterLock(dbPath, quiet), WriterLockError);
+    assert.equal(existsSync(lockPath), true, 'the refusal must leave the foreign-host lock in place');
+    assert.equal(readFileSync(lockPath, 'utf8'), before, 'the refusal must not replace the lock');
 
     // The override is the only way past it.
     process.env.APEX_SCRAPER_FORCE_UNLOCK = '1';
@@ -341,6 +470,7 @@ test('a directory at the lock path surfaces as a filesystem error', () => {
         return true;
       },
     );
+    assert.equal(existsSync(`${dbPath}.lock`), true, 'the rejected path must remain in place');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -362,9 +492,15 @@ test('a symlink at the lock path is rejected with or without the override', () =
   };
 
   try {
+    const before = readFileSync(target, 'utf8');
     assert.throws(() => acquireWriterLock(dbPath, quiet), assertFilesystemError);
+    assert.equal(existsSync(`${dbPath}.lock`), true, 'the rejected symlink must remain in place');
+    assert.equal(readFileSync(target, 'utf8'), before, 'the rejected symlink target must be unchanged');
+
     process.env.APEX_SCRAPER_FORCE_UNLOCK = '1';
     assert.throws(() => acquireWriterLock(dbPath, quiet), assertFilesystemError);
+    assert.equal(existsSync(`${dbPath}.lock`), true, 'the override must not remove the symlink');
+    assert.equal(readFileSync(target, 'utf8'), before, 'the override must not change the symlink target');
   } finally {
     if (previous === undefined) delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
     else process.env.APEX_SCRAPER_FORCE_UNLOCK = previous;
@@ -380,7 +516,10 @@ test('the override does not bypass a live same-host lock', () => {
 
   try {
     const handle = acquireWriterLock(dbPath, quiet);
+    const before = readFileSync(handle.path, 'utf8');
     assert.throws(() => acquireWriterLock(dbPath, quiet), WriterLockError);
+    assert.equal(existsSync(handle.path), true, 'the override must not bypass a live lock');
+    assert.equal(readFileSync(handle.path, 'utf8'), before, 'the refused override must not replace the lock');
     handle.release();
   } finally {
     if (previous === undefined) delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
@@ -554,7 +693,9 @@ test('a second extractor cannot initialise the same data directory', async () =>
 
   try {
     await first.init();
-    assert.ok(existsSync(join(dir, 'test.db.lock')), 'init should take the writer lock');
+    const lockPath = join(dir, 'test.db.lock');
+    assert.ok(existsSync(lockPath), 'init should take the writer lock');
+    const before = readFileSync(lockPath, 'utf8');
 
     const second = new UserTokenExtractor(makeConfig(dir), quiet);
     await assert.rejects(
@@ -562,6 +703,8 @@ test('a second extractor cannot initialise the same data directory', async () =>
       (error: unknown) => error instanceof WriterLockError,
       'a second process must be refused',
     );
+    assert.equal(existsSync(lockPath), true, 'the refused extractor must leave the lock in place');
+    assert.equal(readFileSync(lockPath, 'utf8'), before, 'the refused extractor must not replace the lock');
     // Closing an extractor that never initialised must not throw.
     second.close();
 
