@@ -305,7 +305,7 @@ export class UserTokenExtractor {
 
     const baseline = wantIncremental ? (since ?? progress.newest_message_id ?? null) : null;
     const incrementalDecision = wantIncremental
-      ? decideIncrementalWindow(baseline, savedState)
+      ? decideIncrementalWindow(baseline, savedState, alreadyDone)
       : null;
 
     if (incrementalDecision?.useIncrementalWindow && baseline) {
@@ -329,6 +329,12 @@ export class UserTokenExtractor {
           `${channelName} has shards left pending from an interrupted run; ` +
             `resuming the full extraction instead of a catch-up so the unfinished ` +
             `windows are not skipped.`,
+        );
+      } else if (incrementalDecision?.reason === 'unknown-state') {
+        this.log.warn(
+          `The resume state for ${channelName} was missing or unreadable; ` +
+            `performing a full extraction instead of a catch-up because the prior ` +
+            `shard layout is unknown.`,
         );
       }
 

@@ -17,7 +17,7 @@ import type {
 } from './types.js';
 import { calculateTimeSegments } from './utils.js';
 
-export const RESUME_STATE_VERSION = 2;
+export const RESUME_STATE_VERSION = 3;
 
 /** Keep only the fields we understand, so a corrupt blob cannot leak through. */
 function sanitizeBalance(raw: any): SegmentBalance | null {
@@ -98,17 +98,19 @@ export function parseResumeState(json: string | null | undefined): ChannelResume
   try {
     const parsed = JSON.parse(json) as Partial<ChannelResumeState>;
     if (
-      parsed?.version !== RESUME_STATE_VERSION ||
+      (parsed?.version !== 2 && parsed?.version !== RESUME_STATE_VERSION) ||
       !Array.isArray(parsed.segments) ||
       typeof parsed.parallelism !== 'number'
     ) {
       return null;
     }
+    const migrateV2 = parsed.version === 2;
     const segments: SegmentResumeState[] = parsed.segments.map((seg, index) => ({
       index: typeof seg?.index === 'number' ? seg.index : index,
       after: typeof seg?.after === 'string' ? seg.after : '',
       before: typeof seg?.before === 'string' ? seg.before : '',
-      afterInclusive: seg?.afterInclusive === true,
+      // Unknown legacy windows are inclusive because a duplicate is recoverable, but a skip is not.
+      afterInclusive: migrateV2 ? true : seg?.afterInclusive === true,
       cursor: typeof seg?.cursor === 'string' ? seg.cursor : null,
       done: seg?.done === true,
     }));
@@ -202,7 +204,7 @@ export function resolveSegments(
   return { segments, state: createResumeState(segments, parallelism, freshBalance ?? null) };
 }
 
-export type IncrementalWindowReason = 'ok' | 'no-baseline' | 'pending-shards';
+export type IncrementalWindowReason = 'ok' | 'no-baseline' | 'pending-shards' | 'unknown-state';
 
 export interface IncrementalWindowDecision {
   /** True when this run may use a single catch-up window instead of the saved layout. */
@@ -221,11 +223,14 @@ export interface IncrementalWindowDecision {
  * history. Two states are safe: every shard is done (the normal catch-up after a
  * completed run), or the saved state is a single segment whose lower bound is the
  * baseline - that is a previous catch-up resuming after a failure, not a lost
- * multi-shard layout.
+ * multi-shard layout. A missing state is not evidence that the prior layout
+ * finished: without independent archive evidence, its windows are unknown and
+ * a full extraction is safer than sealing a catch-up over a possible hole.
  */
 export function decideIncrementalWindow(
   baseline: string | null,
   savedState: ChannelResumeState | null,
+  archiveComplete: boolean,
 ): IncrementalWindowDecision {
   if (!baseline) {
     return { useIncrementalWindow: false, reuseSavedWindow: false, reason: 'no-baseline' };
@@ -242,7 +247,13 @@ export function decideIncrementalWindow(
     return { useIncrementalWindow: true, reuseSavedWindow: true, reason: 'ok' };
   }
 
-  if (!savedState || isResumeComplete(savedState)) {
+  if (!savedState) {
+    return archiveComplete
+      ? { useIncrementalWindow: true, reuseSavedWindow: false, reason: 'ok' }
+      : { useIncrementalWindow: false, reuseSavedWindow: false, reason: 'unknown-state' };
+  }
+
+  if (isResumeComplete(savedState)) {
     return { useIncrementalWindow: true, reuseSavedWindow: false, reason: 'ok' };
   }
 

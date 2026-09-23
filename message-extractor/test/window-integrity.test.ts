@@ -16,6 +16,7 @@ import {
   decideIncrementalWindow,
   markSegmentDone,
   parseResumeState,
+  RESUME_STATE_VERSION,
   serializeResumeState,
 } from '../src/resumable.js';
 import type { ExportRow, ScraperConfig } from '../src/types.js';
@@ -91,7 +92,7 @@ test('decideIncrementalWindow allows a catch-up only when nothing is left pendin
   const segments = calculateTimeSegments(channelId, 3);
 
   // No baseline at all: there is nothing to catch up from.
-  assert.deepEqual(decideIncrementalWindow(null, null), {
+  assert.deepEqual(decideIncrementalWindow(null, null, false), {
     useIncrementalWindow: false,
     reuseSavedWindow: false,
     reason: 'no-baseline',
@@ -100,7 +101,7 @@ test('decideIncrementalWindow allows a catch-up only when nothing is left pendin
   // A completed run: every shard is done, so a catch-up window is safe.
   const complete = createResumeState(segments, 3);
   for (const s of complete.segments) markSegmentDone(complete, s.index);
-  assert.deepEqual(decideIncrementalWindow('999', complete), {
+  assert.deepEqual(decideIncrementalWindow('999', complete, false), {
     useIncrementalWindow: true,
     reuseSavedWindow: false,
     reason: 'ok',
@@ -109,7 +110,7 @@ test('decideIncrementalWindow allows a catch-up only when nothing is left pendin
   // A previous *incremental* run that died mid-window: the saved state IS the
   // catch-up window and must be resumed, not replaced.
   const failedCatchUp = createResumeState([{ after: '500', before: '900' }], 1);
-  assert.deepEqual(decideIncrementalWindow('500', failedCatchUp), {
+  assert.deepEqual(decideIncrementalWindow('500', failedCatchUp, false), {
     useIncrementalWindow: true,
     reuseSavedWindow: true,
     reason: 'ok',
@@ -120,7 +121,7 @@ test('decideIncrementalWindow allows a catch-up only when nothing is left pendin
   const partial = createResumeState(segments, 3);
   markSegmentDone(partial, 0);
   markSegmentDone(partial, 2);
-  assert.deepEqual(decideIncrementalWindow('999', partial), {
+  assert.deepEqual(decideIncrementalWindow('999', partial, false), {
     useIncrementalWindow: false,
     reuseSavedWindow: false,
     reason: 'pending-shards',
@@ -130,11 +131,153 @@ test('decideIncrementalWindow allows a catch-up only when nothing is left pendin
 test('decideIncrementalWindow does not reuse a catch-up with an empty upper bound', () => {
   const saved = createResumeState([{ after: '500', before: '' }], 1);
 
-  assert.deepEqual(decideIncrementalWindow('500', saved), {
+  assert.deepEqual(decideIncrementalWindow('500', saved, false), {
     useIncrementalWindow: false,
     reuseSavedWindow: false,
     reason: 'pending-shards',
   });
+});
+
+test('null saved state is unknown without independent archive evidence', () => {
+  assert.deepEqual(decideIncrementalWindow('999', null, false), {
+    useIncrementalWindow: false,
+    reuseSavedWindow: false,
+    reason: 'unknown-state',
+  });
+});
+
+test('null saved state permits catch-up when the archive is independently complete', () => {
+  assert.deepEqual(decideIncrementalWindow('999', null, true), {
+    useIncrementalWindow: true,
+    reuseSavedWindow: false,
+    reason: 'ok',
+  });
+});
+
+test('v2 resume state migrates every legacy window to an inclusive lower bound', () => {
+  const parsed = parseResumeState(
+    JSON.stringify({
+      version: 2,
+      parallelism: 2,
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      segments: [
+        { index: 0, after: '100', before: '300', cursor: '250', done: false },
+        { index: 1, after: '300', before: '500', cursor: null, done: true },
+      ],
+      balance: null,
+    }),
+  );
+
+  assert.equal(parsed?.version, RESUME_STATE_VERSION);
+  assert.deepEqual(parsed?.segments.map((segment) => segment.afterInclusive), [true, true]);
+});
+
+test('v3 resume state preserves an explicitly exclusive lower bound', () => {
+  const parsed = parseResumeState(
+    JSON.stringify({
+      version: 3,
+      parallelism: 1,
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      segments: [
+        {
+          index: 0,
+          after: '500',
+          before: '900',
+          afterInclusive: false,
+          cursor: '700',
+          done: false,
+        },
+      ],
+      balance: null,
+    }),
+  );
+
+  assert.equal(parsed?.version, RESUME_STATE_VERSION);
+  assert.deepEqual(parsed?.segments.map((segment) => segment.afterInclusive), [false]);
+});
+
+test('resume state rejects an unknown future version', () => {
+  const parsed = parseResumeState(
+    JSON.stringify({
+      version: RESUME_STATE_VERSION + 1,
+      parallelism: 1,
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      segments: [
+        {
+          index: 0,
+          after: '500',
+          before: '900',
+          afterInclusive: true,
+          cursor: null,
+          done: false,
+        },
+      ],
+      balance: null,
+    }),
+  );
+
+  assert.equal(parsed, null);
+});
+
+test('an unreadable resume state cannot seal a partial archive as a catch-up', async () => {
+  const dir = makeTmpDir();
+  const jsonPath = join(dir, 'test_json');
+  const channelId = tsToSnowflake(Date.now() - 30 * DAY_MS);
+  const info = { channelId, channelName: 'unknown-state', guildId: 'g1', guildName: 'g' };
+  const segments = calculateTimeSegments(channelId, 3);
+  const idAt = (index: number): string => {
+    const seg = segments[index];
+    const lo = snowflakeToTs(seg.after);
+    const hi = snowflakeToTs(seg.before);
+    return (BigInt(tsToSnowflake(lo + Math.floor((hi - lo) / 2))) + BigInt(index + 1)).toString();
+  };
+  const low = [idAt(0)];
+  const mid = [idAt(1)];
+  const high = [idAt(2)];
+  const all = [...low, ...mid, ...high].sort((a, b) => (BigInt(a) < BigInt(b) ? 1 : -1));
+  const numericSort = (a: string, b: string): number => (BigInt(a) < BigInt(b) ? -1 : 1);
+
+  const seeded = new JsonStorage(jsonPath, quiet, { chunkSize: 50 });
+  seeded.appendMessages(channelId, 'unknown-state', high.map(exportRow));
+  seeded.finalizeChannel(channelId);
+  assert.equal(seeded.loadArchive(channelId)?.completedAt, null);
+
+  const mock = installPagedFetch(all);
+  const extractor = new UserTokenExtractor(makeConfig(dir), quiet);
+
+  try {
+    await extractor.init();
+    const storage = (extractor as unknown as { storage: Storage }).storage;
+    await storage.getOrCreateProgress(channelId, 'g1', 'unknown-state');
+    await storage.updateProgress(channelId, {
+      status: 'error',
+      total_extracted: high.length,
+      newest_message_id: high[0],
+      resume_state: '{unreadable',
+    });
+
+    const result = await extractor.extractChannel(info, { resume: true, incremental: true });
+    const finalState = parseResumeState((await storage.getProgress(channelId))?.resume_state ?? null);
+    const stored = new JsonStorage(jsonPath, quiet, { chunkSize: 50 })
+      .loadAllMessages(channelId)
+      .map((message) => message.id)
+      .sort(numericSort);
+
+    assert.equal(result.success, true, `run failed: ${result.error}`);
+    assert.equal(result.messagesExtracted, mid.length + low.length);
+    assert.deepEqual(stored, [...low, ...mid, ...high].sort(numericSort));
+    assert.equal(
+      finalState?.parallelism,
+      3,
+      'the unknown layout was reported complete as a one-segment catch-up',
+    );
+    assert.equal(finalState?.segments.length, 3);
+    assert.ok(finalState?.segments.every((segment) => segment.done));
+  } finally {
+    extractor.close();
+    mock.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('an incremental catch-up on a channel with pending shards does not orphan them', async () => {
