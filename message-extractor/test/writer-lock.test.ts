@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, unlinkSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, unlinkSync, symlinkSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
 
@@ -198,6 +198,32 @@ test('a directory at the lock path surfaces as a filesystem error', () => {
       },
     );
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a symlink at the lock path is rejected with or without the override', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const target = join(dir, 'target');
+  writeFileSync(target, 'not a lock', 'utf-8');
+  symlinkSync(target, `${dbPath}.lock`);
+  const previous = process.env.APEX_SCRAPER_FORCE_UNLOCK;
+  delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+
+  const assertFilesystemError = (error: unknown): boolean => {
+    assert.ok(!(error instanceof WriterLockError));
+    assert.match((error as Error).message, /not a regular file|symbolic link|symlink/i);
+    return true;
+  };
+
+  try {
+    assert.throws(() => acquireWriterLock(dbPath, quiet), assertFilesystemError);
+    process.env.APEX_SCRAPER_FORCE_UNLOCK = '1';
+    assert.throws(() => acquireWriterLock(dbPath, quiet), assertFilesystemError);
+  } finally {
+    if (previous === undefined) delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+    else process.env.APEX_SCRAPER_FORCE_UNLOCK = previous;
     rmSync(dir, { recursive: true, force: true });
   }
 });
