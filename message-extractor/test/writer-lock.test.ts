@@ -4,7 +4,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, unlinkSync, symlinkSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, unlinkSync, symlinkSync, writeFileSync, existsSync, readFileSync } from 'fs';
+import { createRequire } from 'node:module';
 import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
 
@@ -14,6 +15,36 @@ import type { ScraperConfig } from '../src/types.js';
 import { Logger } from '../src/utils.js';
 
 const quiet = new Logger('error');
+const require = createRequire(import.meta.url);
+const tsxCli = require.resolve('tsx/cli');
+
+function cliEnvironment(
+  dbPath: string,
+  overrides: Record<string, string | undefined> = {},
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    DISCORD_USER_TOKEN: 'test-token',
+    DISCORD_BOT_TOKEN: '',
+    DB_PATH: dbPath,
+    LOG_LEVEL: 'error',
+  };
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === undefined) delete env[key];
+    else env[key] = value;
+  }
+  return env;
+}
+
+function runCli(args: string[], env: NodeJS.ProcessEnv) {
+  const result = spawnSync(process.execPath, [tsxCli, 'src/cli.ts', ...args], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    env,
+  });
+  assert.ifError(result.error);
+  return result;
+}
 
 class ThrowingInfoLogger extends Logger {
   info(): void {
@@ -54,6 +85,28 @@ function writeLock(dbPath: string, info: Partial<WriterLockInfo>): string {
   );
   return lockPath;
 }
+
+test('query is refused while another process owns the writer lock', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const owner = acquireWriterLock(dbPath, quiet);
+
+  try {
+    const before = readFileSync(owner.path, 'utf8');
+    const result = runCli(
+      ['query', 'SELECT 1'],
+      cliEnvironment(dbPath, { APEX_SCRAPER_FORCE_UNLOCK: undefined }),
+    );
+
+    assert.equal(result.status, 1, result.stderr || result.stdout);
+    assert.match(result.stderr, /Only one process may write a data directory/);
+    assert.equal(existsSync(owner.path), true, 'the refusal must leave the lock in place');
+    assert.equal(readFileSync(owner.path, 'utf8'), before, 'the refusal must not replace the lock');
+  } finally {
+    owner.release();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('a second writer is refused while the lock is held, and allowed after release', () => {
   const dir = makeTmpDir();

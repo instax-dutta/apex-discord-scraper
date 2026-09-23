@@ -473,7 +473,7 @@ Every command is also available directly as `node dist/cli.js <command>` or
 | `status` | Per-channel progress, resume state, shard balance, rate limiter |
 | `dump <id> [file]` | Stream a channel out to a single JSON file |
 | `reset <id...>` | Forget progress and delete chunks for a channel |
-| `query "<sql>"` | Run read-only SQL against the metadata database |
+| `query "<sql>"` | Run SQL against the metadata database while holding the writer lock |
 
 ### `extract` options
 
@@ -1090,7 +1090,7 @@ docker run -v $(pwd)/data:/app/data -e DISCORD_USER_TOKEN=your_token apex-scrape
   remove the lock file manually or set `APEX_SCRAPER_FORCE_UNLOCK=1` and retry; the override
   explicitly accepts the risk of racing another writer. If the lock file cannot be read, its owner
   is unknown and the override cannot establish ownership, so remove it manually only after
-  identifying the owner. The `query` command does not take the lock.
+  identifying the owner.
 - **Access limited to your permissions**: You can only extract channels you can already read in Discord.
 - **History starts when you joined**: Discord only serves message history from the point you
   gained access to the channel. No tool can retrieve what was there before you could see it -

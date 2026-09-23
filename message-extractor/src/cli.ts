@@ -7,7 +7,9 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'fs
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import type { ScraperConfig } from './types.js';
+import { Storage } from './storage.js';
 import { UserTokenExtractor, type ChannelInfo } from './userTokenExtractor.js';
+import { acquireWriterLock } from './writerLock.js';
 import { Logger, formatDuration, formatBytes, resolveJsonlPath } from './utils.js';
 import { parseResumeState, describeResumeState } from './resumable.js';
 import { describeBalance, formatCount } from './segments.js';
@@ -630,25 +632,27 @@ async function cmdQuery(config: ScraperConfig, args: string[]) {
 
   const sql = args.join(' ');
   const log = new Logger('error');
-  const { Storage } = await import('./storage.js');
-  const storage = new Storage(config.dbPath, log);
-  await storage.init();
-
+  const writerLock = acquireWriterLock(config.dbPath, log);
   try {
-    const stmt = (storage as any).db.prepare(sql);
-    const results: any[] = [];
-    while (stmt.step()) {
-      results.push(stmt.getAsObject());
+    const storage = new Storage(config.dbPath, log);
+    try {
+      await storage.init();
+      const stmt = (storage as any).db.prepare(sql);
+      try {
+        const results: any[] = [];
+        while (stmt.step()) {
+          results.push(stmt.getAsObject());
+        }
+        console.log(JSON.stringify(results, null, 2));
+      } finally {
+        stmt.free();
+      }
+    } finally {
+      storage.close();
     }
-    stmt.free();
-    console.log(JSON.stringify(results, null, 2));
-  } catch (e: any) {
-    console.error(`Query error: ${e.message}`);
-    storage.close();
-    process.exit(1);
+  } finally {
+    writerLock.release();
   }
-
-  storage.close();
 }
 
 function printUsage() {
