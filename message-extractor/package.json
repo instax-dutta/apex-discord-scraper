@@ -1,0 +1,39 @@
+{
+  "name": "apex-discord-scraper",
+  "version": "1.1.0",
+  "description": "Headless multi-channel Discord message extractor using user tokens - no bot required",
+  "type": "module",
+  "bin": {
+    "apex-scraper": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/cli.js",
+    "dev": "tsx src/cli.ts",
+    "test": "tsx --test test/*.test.ts",
+    "extract": "tsx src/cli.ts extract",
+    "live": "tsx src/cli.ts live",
+    "watch": "tsx src/cli.ts watch",
+    "validate": "tsx src/cli.ts validate",
+    "list": "tsx src/cli.ts list",
+    "status": "tsx src/cli.ts status",
+    "dump": "tsx src/cli.ts dump",
+    "reset": "tsx src/cli.ts reset",
+    "query": "tsx src/cli.ts query"
+  },
+  "keywords": ["discord", "scraper", "messages", "extractor", "user-token", "headless"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "sql.js": "^1.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.5",
+    "@types/sql.js": "^1.4.9",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=18.15.0"
+  }
+}
