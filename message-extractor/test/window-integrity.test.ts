@@ -127,6 +127,16 @@ test('decideIncrementalWindow allows a catch-up only when nothing is left pendin
   });
 });
 
+test('decideIncrementalWindow does not reuse a catch-up with an empty upper bound', () => {
+  const saved = createResumeState([{ after: '500', before: '' }], 1);
+
+  assert.deepEqual(decideIncrementalWindow('500', saved), {
+    useIncrementalWindow: false,
+    reuseSavedWindow: false,
+    reason: 'pending-shards',
+  });
+});
+
 test('an incremental catch-up on a channel with pending shards does not orphan them', async () => {
   const dir = makeTmpDir();
   const jsonPath = join(dir, 'test_json');

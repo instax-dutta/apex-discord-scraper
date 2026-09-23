@@ -233,6 +233,7 @@ export function decideIncrementalWindow(
     savedState.parallelism === 1 &&
     savedState.segments.length === 1 &&
     savedState.segments[0].after === baseline &&
+    savedState.segments[0].before.length > 0 &&
     !savedState.segments[0].done
   ) {
     return { useIncrementalWindow: true, reuseSavedWindow: true, reason: 'ok' };
