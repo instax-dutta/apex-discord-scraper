@@ -1,11 +1,11 @@
 // Cross-process writer lock tests.
 // Run with: npm test
 
-import { test } from 'node:test';
+import { mock, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, unlinkSync, symlinkSync, writeFileSync, existsSync, readFileSync } from 'fs';
-import { createRequire } from 'node:module';
+import fs, { mkdtempSync, mkdirSync, rmSync, unlinkSync, symlinkSync, writeFileSync, existsSync, readFileSync } from 'fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
 
@@ -473,6 +473,42 @@ function makeConfig(dir: string): ScraperConfig {
     balanceShards: false,
   };
 }
+
+test('a failed writer-lock release remains retryable through extractor close', async () => {
+  const dir = makeTmpDir();
+  const lockPath = join(dir, 'test.db.lock');
+  const extractor = new UserTokenExtractor(makeConfig(dir), quiet);
+  const originalUnlinkSync = fs.unlinkSync;
+  let failNextUnlink = true;
+
+  try {
+    await extractor.init();
+    mock.method(fs, 'unlinkSync', ((path: Parameters<typeof fs.unlinkSync>[0]) => {
+      if (failNextUnlink) {
+        failNextUnlink = false;
+        throw Object.assign(new Error('injected unlink failure'), { code: 'EACCES' });
+      }
+      return originalUnlinkSync(path);
+    }) as typeof fs.unlinkSync);
+    syncBuiltinESMExports();
+
+    try {
+      extractor.close();
+      assert.equal(existsSync(lockPath), true, 'a failed unlink must leave the lock for retry');
+    } finally {
+      mock.restoreAll();
+      syncBuiltinESMExports();
+    }
+
+    extractor.close();
+    assert.equal(existsSync(lockPath), false, 'the next close must retry the unlink');
+  } finally {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+    extractor.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('close stops live admission before releasing the writer lock', async () => {
   const dir = makeTmpDir();

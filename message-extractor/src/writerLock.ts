@@ -55,7 +55,7 @@ export function makeWriterLockCleanupError(
 
 export interface WriterLockHandle {
   readonly path: string;
-  /** Removes the lock file. Idempotent, and never throws. */
+  /** Removes the lock file. Idempotent, never throws, and remains retryable after failure. */
   release(): void;
 }
 
@@ -187,13 +187,17 @@ function makeWriterLockHandle(lockPath: string, token: string, log?: Logger): Wr
     path: lockPath,
     release() {
       if (released) return;
-      released = true;
       try {
         const state = readPathState(lockPath);
-        if (state.status !== 'present' || state.holder?.token !== token) return;
+        if (state.status !== 'present' || state.holder?.token !== token) {
+          released = true;
+          return;
+        }
         unlinkSync(lockPath);
+        released = true;
       } catch (error: any) {
-        if (error?.code !== 'ENOENT') {
+        if (error?.code === 'ENOENT') released = true;
+        else {
           warnSafely(log, `Could not remove the writer lock at ${lockPath}: ${error?.message ?? error}`);
         }
       }

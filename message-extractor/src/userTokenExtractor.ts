@@ -123,7 +123,7 @@ export class UserTokenExtractor {
   private readonly liveCaptures = new Set<LiveCapture>();
   private stopRequested = false;
   readonly rateLimiter: RateLimitFailsafe;
-  /** Held for this process's lifetime; released in close(). */
+  /** Released in close() and retained so a failed unlink can be retried. */
   private writerLock: WriterLockHandle | null = null;
 
   constructor(config: ScraperConfig, log?: Logger) {
@@ -1036,7 +1036,6 @@ export class UserTokenExtractor {
     } finally {
       // A cleanup failure must not leave the data directory locked until manual removal.
       this.writerLock?.release();
-      this.writerLock = null;
     }
   }
 }
