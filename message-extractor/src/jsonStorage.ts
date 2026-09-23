@@ -291,13 +291,12 @@ export class JsonStorage {
     let completedAt: string | null = null;
 
     for (const filename of chunkFiles) {
-      // Through `loadChunk`, so a part a crash left open (JSON Lines) is
-      // recovered alongside the completed ones.
-      const chunk = this.loadChunk(channelId, filename);
-      if (!chunk || typeof chunk.part !== 'number' || !Array.isArray(chunk.messages)) {
+      const read = this.readPart(channelId, filename);
+      if (!read || typeof read.chunk.part !== 'number') {
         this.log.warn(`Skipping unreadable chunk ${filename}`);
         continue;
       }
+      const chunk = read.chunk;
 
       channelName = chunk.channelName || channelName;
       extractedAt = chunk.extractedAt || extractedAt;
@@ -308,6 +307,9 @@ export class JsonStorage {
         startId: chunk.startId,
         endId: chunk.endId,
         updatedAt: chunk.extractedAt,
+        // An open part stays open, so `getTail` seals it on the next append
+        // instead of leaving two on-disk formats in one archive forever.
+        open: read.open,
       });
       totalMessages += chunk.messageCount;
     }
@@ -849,20 +851,36 @@ export class JsonStorage {
   // ==================== Reading ====================
 
   /**
-   * Read one part. A completed chunk is a single JSON value; a part still being
-   * appended to is JSON Lines. The object is tried first so the (far more
-   * common) completed part pays nothing for the other shape.
+   * Read one part and report which on-disk shape it was.
+   *
+   * A completed chunk is a single JSON value; a part still being appended to is
+   * JSON Lines. `rebuildArchive` needs the distinction to keep persisting
+   * `open: true`, and reading the file twice to learn it would be wasteful.
    */
-  loadChunk(channelId: string, filename: string): JsonChunk | null {
+  private readPart(
+    channelId: string,
+    filename: string,
+  ): { chunk: JsonChunk; open: boolean } | null {
     const filepath = join(this.getChannelDir(channelId), filename);
     if (!existsSync(filepath)) return null;
 
     const text = readFileSync(filepath, 'utf-8');
     try {
-      return JSON.parse(text) as JsonChunk;
+      const chunk = JSON.parse(text) as JsonChunk;
+      if (Array.isArray(chunk.messages)) return { chunk, open: false };
     } catch {
-      return this.parseOpenPart(text, filename);
+      // Not a single JSON value, so it is an open JSON-Lines part.
     }
+
+    // A header-only open part parses as JSON but carries no message array;
+    // `parseOpenPart` normalises it to an empty message list.
+    const chunk = this.parseOpenPart(text, filename);
+    return chunk ? { chunk, open: true } : null;
+  }
+
+  /** Read one part. A completed chunk is a single JSON value; an open part is JSON Lines. */
+  loadChunk(channelId: string, filename: string): JsonChunk | null {
+    return this.readPart(channelId, filename)?.chunk ?? null;
   }
 
   /**
