@@ -137,6 +137,17 @@ export class LiveCapture {
     if (this.running) throw new Error('Live capture is already running');
     if (channels.length === 0) throw new Error('No channels provided for live capture');
 
+    // A failed start must leave no per-attempt state for the next attempt to inherit.
+    this.targets.clear();
+    this.buffers.clear();
+    this.sessionCounts.clear();
+    this.baseTotals.clear();
+    this.newestIds.clear();
+    this.floorIds.clear();
+    this.dedup.clear();
+    this.flushChains.clear();
+    this.sessionId = null;
+
     this.startedAt = new Date().toISOString();
 
     // What each channel looked like before this run claimed it. A source that
