@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
-import { closeSync, lstatSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
+import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { hostname } from 'os';
+import { dirname } from 'path';
 import { Logger } from './utils.js';
 
 /** What the lock file records about the process that owns the data directory. */
@@ -89,10 +90,16 @@ function isProcessAlive(pid: number): boolean {
 function readHolder(lockPath: string): WriterLockInfo | null {
   try {
     const parsed = JSON.parse(readFileSync(lockPath, 'utf-8')) as Partial<WriterLockInfo>;
-    if (typeof parsed?.pid !== 'number' || typeof parsed.token !== 'string') return null;
+    const recordedHostname = typeof parsed?.hostname === 'string' ? parsed.hostname.trim() : '';
+    if (
+      typeof parsed?.pid !== 'number' ||
+      typeof parsed.token !== 'string' ||
+      !recordedHostname ||
+      recordedHostname.toLowerCase() === 'unknown'
+    ) return null;
     return {
       pid: parsed.pid,
-      hostname: typeof parsed.hostname === 'string' ? parsed.hostname : 'unknown',
+      hostname: recordedHostname,
       acquiredAt: typeof parsed.acquiredAt === 'string' ? parsed.acquiredAt : 'unknown',
       command: typeof parsed.command === 'string' ? parsed.command : 'unknown',
       token: parsed.token,
@@ -265,6 +272,7 @@ function acquireExistingLock(lockPath: string, info: WriterLockInfo, log?: Logge
  */
 export function acquireWriterLock(dbPath: string, log?: Logger): WriterLockHandle {
   const lockPath = `${dbPath}.lock`;
+  mkdirSync(dirname(lockPath), { recursive: true });
   readPathState(lockPath);
   const info = makeWriterLockInfo();
 

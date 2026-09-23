@@ -164,6 +164,19 @@ function writeLock(dbPath: string, info: Partial<WriterLockInfo>): string {
   return lockPath;
 }
 
+test('acquiring a lock creates its missing parent directory', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'nested', 'archive.db');
+
+  try {
+    const handle = acquireWriterLock(dbPath, quiet);
+    assert.equal(existsSync(handle.path), true);
+    handle.release();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('query is refused while another process owns the writer lock', () => {
   const dir = makeTmpDir();
   const dbPath = join(dir, 'test.db');
@@ -388,6 +401,30 @@ test('a dead same-host lock is not automatically reclaimed', () => {
     );
     assert.equal(existsSync(lockPath), true, 'the refusal must leave the stale lock in place');
     assert.equal(readFileSync(lockPath, 'utf8'), before, 'the refusal must not replace the stale lock');
+  } finally {
+    if (previous === undefined) delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+    else process.env.APEX_SCRAPER_FORCE_UNLOCK = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the override does not reclaim metadata without a usable hostname', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const lockPath = `${dbPath}.lock`;
+  const previous = process.env.APEX_SCRAPER_FORCE_UNLOCK;
+  process.env.APEX_SCRAPER_FORCE_UNLOCK = '1';
+  writeFileSync(
+    lockPath,
+    `${JSON.stringify({ pid: process.pid, token: 'incomplete-owner' })}\n`,
+    'utf8',
+  );
+  const before = readFileSync(lockPath, 'utf8');
+
+  try {
+    assert.throws(() => acquireWriterLock(dbPath, quiet), WriterLockError);
+    assert.equal(existsSync(lockPath), true, 'the unknown owner must keep the lock in place');
+    assert.equal(readFileSync(lockPath, 'utf8'), before, 'the unknown owner lock must be unchanged');
   } finally {
     if (previous === undefined) delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
     else process.env.APEX_SCRAPER_FORCE_UNLOCK = previous;
