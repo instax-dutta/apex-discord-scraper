@@ -45,6 +45,14 @@ export class WriterLockCleanupError extends Error {
   }
 }
 
+export function makeWriterLockCleanupError(
+  lockPath: string,
+  cause: unknown,
+  cleanupCause: unknown,
+): WriterLockCleanupError {
+  return new WriterLockCleanupError(lockPath, cause, cleanupCause);
+}
+
 export interface WriterLockHandle {
   readonly path: string;
   /** Removes the lock file. Idempotent, and never throws. */
@@ -166,7 +174,7 @@ function writeAndCloseLock(fd: number, lockPath: string, info: WriterLockInfo): 
       unlinkSync(lockPath);
     } catch (cleanupCause: any) {
       if (cleanupCause?.code !== 'ENOENT') {
-        throw new WriterLockCleanupError(lockPath, error, cleanupCause);
+        throw makeWriterLockCleanupError(lockPath, error, cleanupCause);
       }
     }
     throw error;

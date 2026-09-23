@@ -8,7 +8,7 @@ import { mkdtempSync, mkdirSync, rmSync, unlinkSync, symlinkSync, writeFileSync,
 import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
 
-import { acquireWriterLock, WriterLockError, type WriterLockInfo } from '../src/writerLock.js';
+import { acquireWriterLock, makeWriterLockCleanupError, WriterLockCleanupError, WriterLockError, type WriterLockInfo } from '../src/writerLock.js';
 import { Logger } from '../src/utils.js';
 
 const quiet = new Logger('error');
@@ -294,4 +294,18 @@ test('a throwing warn logger cannot escape release', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('cleanup error construction preserves both causes and names the lock path', () => {
+  const lockPath = '/tmp/apex-scraper/archive.db.lock';
+  const writeCause = new Error('write or close failed');
+  const cleanupCause = new Error('lock cleanup failed');
+
+  const error = makeWriterLockCleanupError(lockPath, writeCause, cleanupCause);
+
+  assert.ok(error instanceof WriterLockCleanupError);
+  assert.equal(error.lockPath, lockPath);
+  assert.ok(error.message.includes(lockPath));
+  assert.equal((error as Error & { cause?: unknown }).cause, writeCause);
+  assert.equal(error.cleanupCause, cleanupCause);
 });
