@@ -195,6 +195,9 @@ function makeWriterLockHandle(lockPath: string, token: string, log?: Logger): Wr
     release() {
       if (released) return;
       try {
+        // The token protects normal successor acquisition, but pathname unlink cannot be
+        // conditional on it. Manually replacing the file between these steps accepts the
+        // same race as the force override.
         const state = readPathState(lockPath);
         if (state.status !== 'present' || state.holder?.token !== token) {
           released = true;
