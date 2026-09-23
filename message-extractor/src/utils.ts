@@ -76,6 +76,7 @@ export function calculateTimeSegments(
     return [{
       after: channelId,  // Use channel ID as the start (oldest possible)
       before: tsToSnowflake(nowTs + 60000),  // Add 1 minute buffer
+      afterInclusive: true,
     }];
   }
 
@@ -92,6 +93,7 @@ export function calculateTimeSegments(
     segments.push({
       after: tsToSnowflake(start),
       before: tsToSnowflake(end),
+      afterInclusive: true,
     });
   }
 

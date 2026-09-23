@@ -79,21 +79,26 @@ function sweepWindow(
   segments: TimeSegment[],
   state: ChannelResumeState,
   indexes: number[],
-): { after: string; before: string } {
+): TimeSegment {
   let after = BigInt(segments[indexes[0]].after);
+  let afterInclusive = segments[indexes[0]].afterInclusive === true;
   let before = BigInt(getSegmentState(state, indexes[0]).cursor ?? segments[indexes[0]].before);
 
   for (const index of indexes) {
-    const lower = BigInt(segments[index].after);
-    if (lower < after) after = lower;
+    const segment = segments[index];
+    const lower = BigInt(segment.after);
+    if (lower < after) {
+      after = lower;
+      afterInclusive = segment.afterInclusive === true;
+    }
 
     // A shard that already fetched part of its window continues from its
     // cursor, so the sweep must not re-fetch above it.
-    const upper = BigInt(getSegmentState(state, index).cursor ?? segments[index].before);
+    const upper = BigInt(getSegmentState(state, index).cursor ?? segment.before);
     if (upper > before) before = upper;
   }
 
-  return { after: after.toString(), before: before.toString() };
+  return { after: after.toString(), before: before.toString(), afterInclusive };
 }
 
 /**
@@ -206,6 +211,7 @@ export class UserTokenFetcher {
 
     const afterBound = BigInt(segment.after);
     const beforeBound = BigInt(segment.before);
+    const afterIsInclusive = segment.afterInclusive === true;
 
     let before = seg.cursor ?? segment.before;
     let lastOldest: string | null = null;
@@ -235,10 +241,8 @@ export class UserTokenFetcher {
 
         for (const msg of messages) {
           const id = BigInt(msg.id);
-          // Strict on both ends: adjacent shards share a boundary value, and an
-          // incremental segment's lower bound is a real message id we already
-          // have, so it must not be re-fetched.
-          if (id > afterBound && id < beforeBound) {
+          const aboveLowerBound = afterIsInclusive ? id >= afterBound : id > afterBound;
+          if (aboveLowerBound && id < beforeBound) {
             onMessage(toExportRow(msg));
             fetched++;
           }
@@ -290,9 +294,10 @@ export class UserTokenFetcher {
     signal: AbortState,
     onMessage: (row: ExportRow) => void,
     options: { pageDelayMs: number; retries: number; afterPage?: () => Promise<void> },
-    window: { after: string; before: string },
+    window: TimeSegment,
   ): Promise<{ fetched: number; completed: boolean; error?: Error }> {
     const afterBound = BigInt(window.after);
+    const afterIsInclusive = window.afterInclusive === true;
     let before: string | undefined = window.before;
     let lastOldest: string | null = null;
     let fetched = 0;
@@ -311,11 +316,15 @@ export class UserTokenFetcher {
         }
 
         for (const msg of messages) {
-          // Same exclusive lower bound the shard fetcher applies, so a sweep
-          // cannot re-append a message the archive already has.
-          if (BigInt(msg.id) <= afterBound) continue;
-          onMessage(toExportRow(msg));
-          fetched++;
+          // Same lower-bound rule the shard fetcher applies, so a sweep over an
+          // incremental window cannot re-append the baseline message.
+          const atOrAboveLowerBound = afterIsInclusive
+            ? BigInt(msg.id) >= afterBound
+            : BigInt(msg.id) > afterBound;
+          if (atOrAboveLowerBound) {
+            onMessage(toExportRow(msg));
+            fetched++;
+          }
         }
 
         if (messages.length < PAGE_SIZE) {

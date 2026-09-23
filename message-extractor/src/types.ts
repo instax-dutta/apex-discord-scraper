@@ -138,8 +138,17 @@ export interface ChannelConfig {
 
 // Time segment for parallel fetching
 export interface TimeSegment {
-  after: string;   // snowflake ID (inclusive)
-  before: string;  // snowflake ID (exclusive)
+  after: string;   // snowflake ID
+  before: string;  // snowflake ID
+  /**
+   * True when `after` is the lower bound of a half-open window, so a message
+   * whose id equals `after` belongs to this segment. Time-derived shards set it:
+   * adjacent shards share a boundary value, and an exclusive lower bound would
+   * drop a message sitting exactly on that boundary from both of them. An
+   * incremental catch-up leaves it unset, because there `after` is a real
+   * message id that is already in the archive.
+   */
+  afterInclusive?: boolean;
 }
 
 // Fetch progress callback
@@ -176,6 +185,8 @@ export interface SegmentResumeState {
    */
   after: string;
   before: string;
+  /** Mirrors `TimeSegment.afterInclusive`; persisted so resume keeps the window exact. */
+  afterInclusive?: boolean;
   /** Next `before` value to use for this shard, or null when finished. */
   cursor: string | null;
   done: boolean;

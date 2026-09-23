@@ -53,6 +53,7 @@ export function createResumeState(
       index,
       after: segment.after,
       before: segment.before,
+      afterInclusive: segment.afterInclusive,
       cursor: null,
       done: false,
     })),
@@ -107,6 +108,7 @@ export function parseResumeState(json: string | null | undefined): ChannelResume
       index: typeof seg?.index === 'number' ? seg.index : index,
       after: typeof seg?.after === 'string' ? seg.after : '',
       before: typeof seg?.before === 'string' ? seg.before : '',
+      afterInclusive: seg?.afterInclusive === true,
       cursor: typeof seg?.cursor === 'string' ? seg.cursor : null,
       done: seg?.done === true,
     }));
@@ -141,6 +143,7 @@ export function cloneResumeState(state: ChannelResumeState): ChannelResumeState 
       index: s.index,
       after: s.after,
       before: s.before,
+      afterInclusive: s.afterInclusive,
       cursor: s.cursor,
       done: s.done,
     })),
@@ -187,7 +190,7 @@ export function resolveSegments(
       segments: saved!.segments
         .slice()
         .sort((a, b) => a.index - b.index)
-        .map((s) => ({ after: s.after, before: s.before })),
+        .map((s) => ({ after: s.after, before: s.before, afterInclusive: s.afterInclusive })),
       state: saved!,
     };
   }
