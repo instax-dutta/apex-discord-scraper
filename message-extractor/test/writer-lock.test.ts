@@ -9,6 +9,7 @@ import { createRequire } from 'node:module';
 import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
 
+import { Storage } from '../src/storage.js';
 import { acquireWriterLock, makeWriterLockCleanupError, WriterLockCleanupError, WriterLockError, type WriterLockInfo } from '../src/writerLock.js';
 import { UserTokenExtractor } from '../src/userTokenExtractor.js';
 import type { ScraperConfig } from '../src/types.js';
@@ -104,6 +105,36 @@ test('query is refused while another process owns the writer lock', () => {
     assert.equal(readFileSync(owner.path, 'utf8'), before, 'the refusal must not replace the lock');
   } finally {
     owner.release();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a post-init CLI failure releases the writer lock', async () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const lockPath = `${dbPath}.lock`;
+  const jsonRoot = dbPath.replace(/\.db$/, '_json');
+  const channelId = '123456789012345678';
+  const storage = new Storage(dbPath, quiet);
+
+  try {
+    await storage.init();
+    await storage.getOrCreateProgress(channelId, 'guild-1', 'channel');
+    storage.close();
+    mkdirSync(jsonRoot, { recursive: true });
+    writeFileSync(join(jsonRoot, channelId), 'not a directory', 'utf8');
+
+    const result = runCli(
+      ['status'],
+      cliEnvironment(dbPath, { APEX_SCRAPER_FORCE_UNLOCK: undefined }),
+    );
+
+    assert.equal(result.status, 1, result.stderr || result.stdout);
+    assert.match(result.stderr, /not a directory|ENOTDIR/i);
+    assert.equal(existsSync(lockPath), false, 'the failed command must release its lock');
+  } finally {
+    storage.close();
+    rmSync(lockPath, { force: true });
     rmSync(dir, { recursive: true, force: true });
   }
 });
