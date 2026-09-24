@@ -49,6 +49,41 @@ function runCli(args: string[], env: NodeJS.ProcessEnv) {
   return result;
 }
 
+function runCliWithUnlinkFailure(args: string[], env: NodeJS.ProcessEnv) {
+  const preloadDir = makeTmpDir();
+  const preloadPath = join(preloadDir, 'fail-unlink.cjs');
+  writeFileSync(
+    preloadPath,
+    `
+      const fs = require('node:fs');
+      const { syncBuiltinESMExports } = require('node:module');
+      fs.unlinkSync = () => {
+        throw Object.assign(new Error('injected unlink failure'), { code: 'EACCES' });
+      };
+      syncBuiltinESMExports();
+    `,
+    'utf8',
+  );
+
+  try {
+    return runCli(args, {
+      ...env,
+      NODE_OPTIONS: `${env.NODE_OPTIONS ? `${env.NODE_OPTIONS} ` : ''}--require=${preloadPath}`,
+    });
+  } finally {
+    rmSync(preloadDir, { recursive: true, force: true });
+  }
+}
+
+function assertLockRecoveryWarning(result: ReturnType<typeof runCli>, lockPath: string): void {
+  const output = `${result.stdout}\n${result.stderr}`;
+  assert.ok(output.includes(lockPath), `the warning must name ${lockPath}: ${output}`);
+  assert.match(output, /\[WARN\]/);
+  assert.match(output, /may remain/i);
+  assert.match(output, /remove it manually/i);
+  assert.match(output, /APEX_SCRAPER_FORCE_UNLOCK=1/);
+}
+
 function waitForChildMessage(child: ChildProcess, expected: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
@@ -220,6 +255,72 @@ test('query is refused while another process owns the writer lock', () => {
     assert.equal(readFileSync(owner.path, 'utf8'), before, 'the refusal must not replace the lock');
   } finally {
     owner.release();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('query warns when its writer lock cannot be released', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const lockPath = `${dbPath}.lock`;
+
+  try {
+    const result = runCliWithUnlinkFailure(
+      ['query', 'SELECT 1'],
+      cliEnvironment(dbPath, { APEX_SCRAPER_FORCE_UNLOCK: undefined }),
+    );
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assertLockRecoveryWarning(result, lockPath);
+    assert.equal(existsSync(lockPath), true, 'the failed release must leave the lock for manual recovery');
+  } finally {
+    rmSync(lockPath, { force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an initialized command warns when its writer lock cannot be released', async () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const lockPath = `${dbPath}.lock`;
+  const storage = new Storage(dbPath, quiet);
+
+  try {
+    await storage.init();
+    storage.close();
+
+    const result = runCliWithUnlinkFailure(
+      ['status'],
+      cliEnvironment(dbPath, { APEX_SCRAPER_FORCE_UNLOCK: undefined }),
+    );
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assertLockRecoveryWarning(result, lockPath);
+    assert.equal(existsSync(lockPath), true, 'the failed release must leave the lock for manual recovery');
+  } finally {
+    storage.close();
+    rmSync(lockPath, { force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an initialized command warns when init cleanup cannot release its lock', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const lockPath = `${dbPath}.lock`;
+  mkdirSync(dbPath, { recursive: true });
+
+  try {
+    const result = runCliWithUnlinkFailure(
+      ['status'],
+      cliEnvironment(dbPath, { APEX_SCRAPER_FORCE_UNLOCK: undefined }),
+    );
+
+    assert.equal(result.status, 1, result.stderr || result.stdout);
+    assertLockRecoveryWarning(result, lockPath);
+    assert.equal(existsSync(lockPath), true, 'the failed release must leave the lock for manual recovery');
+  } finally {
+    rmSync(lockPath, { force: true });
     rmSync(dir, { recursive: true, force: true });
   }
 });

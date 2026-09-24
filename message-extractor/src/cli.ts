@@ -106,17 +106,41 @@ function getConfig(): ScraperConfig {
   };
 }
 
+function warnIfWriterLockReleaseFailed(lockPath: string, log: Logger): void {
+  log.warn(
+    `Writer lock at ${lockPath} could not be removed and may remain. ` +
+    `Verify that no writer is active, then remove it manually or set ` +
+    `APEX_SCRAPER_FORCE_UNLOCK=1 and retry.`,
+  );
+}
+
+function remainingWriterLockPath(extractor: UserTokenExtractor): string | null {
+  const handle = (extractor as unknown as { writerLock?: { path: string } | null }).writerLock;
+  return handle?.path ?? null;
+}
+
 async function withInitializedExtractor<T>(
   config: ScraperConfig,
   log: Logger,
   work: (extractor: UserTokenExtractor) => Promise<T>,
 ): Promise<T> {
   const extractor = new UserTokenExtractor(config, log);
-  await extractor.init();
+  try {
+    await extractor.init();
+  } catch (error) {
+    const lockPath = remainingWriterLockPath(extractor);
+    if (lockPath) warnIfWriterLockReleaseFailed(lockPath, log);
+    throw error;
+  }
   try {
     return await work(extractor);
   } finally {
-    extractor.close();
+    try {
+      extractor.close();
+    } finally {
+      const lockPath = remainingWriterLockPath(extractor);
+      if (lockPath) warnIfWriterLockReleaseFailed(lockPath, log);
+    }
   }
 }
 
@@ -642,7 +666,7 @@ async function cmdQuery(config: ScraperConfig, args: string[]) {
   }
 
   const sql = args.join(' ');
-  const log = new Logger('error');
+  const log = new Logger('warn');
   const writerLock = acquireWriterLock(config.dbPath, log);
   try {
     const storage = new Storage(config.dbPath, log);
@@ -662,7 +686,9 @@ async function cmdQuery(config: ScraperConfig, args: string[]) {
       storage.close();
     }
   } finally {
-    writerLock.release();
+    if (!writerLock.release()) {
+      warnIfWriterLockReleaseFailed(writerLock.path, log);
+    }
   }
 }
 
