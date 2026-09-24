@@ -109,8 +109,9 @@ function getConfig(): ScraperConfig {
 function warnIfWriterLockReleaseFailed(lockPath: string, log: Logger): void {
   log.warn(
     `Writer lock at ${lockPath} could not be removed and may remain. ` +
-    `Verify that no writer is active, then remove it manually or set ` +
-    `APEX_SCRAPER_FORCE_UNLOCK=1 and retry.`,
+    `Verify that no writer is active, then remove it manually. ` +
+    `The override is usable only when the lock has usable holder metadata and the recorded owner is inactive; ` +
+    `if so, set APEX_SCRAPER_FORCE_UNLOCK=1 and retry. It accepts the risk of racing another writer.`,
   );
 }
 

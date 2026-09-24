@@ -49,21 +49,10 @@ function runCli(args: string[], env: NodeJS.ProcessEnv) {
   return result;
 }
 
-function runCliWithUnlinkFailure(args: string[], env: NodeJS.ProcessEnv) {
+function runCliWithPreload(args: string[], env: NodeJS.ProcessEnv, source: string) {
   const preloadDir = makeTmpDir();
-  const preloadPath = join(preloadDir, 'fail-unlink.cjs');
-  writeFileSync(
-    preloadPath,
-    `
-      const fs = require('node:fs');
-      const { syncBuiltinESMExports } = require('node:module');
-      fs.unlinkSync = () => {
-        throw Object.assign(new Error('injected unlink failure'), { code: 'EACCES' });
-      };
-      syncBuiltinESMExports();
-    `,
-    'utf8',
-  );
+  const preloadPath = join(preloadDir, 'release-failure.cjs');
+  writeFileSync(preloadPath, source, 'utf8');
 
   try {
     return runCli(args, {
@@ -75,13 +64,49 @@ function runCliWithUnlinkFailure(args: string[], env: NodeJS.ProcessEnv) {
   }
 }
 
+function runCliWithUnlinkFailure(args: string[], env: NodeJS.ProcessEnv) {
+  return runCliWithPreload(
+    args,
+    env,
+    `
+      const fs = require('node:fs');
+      const { syncBuiltinESMExports } = require('node:module');
+      fs.unlinkSync = () => {
+        throw Object.assign(new Error('injected unlink failure'), { code: 'EACCES' });
+      };
+      syncBuiltinESMExports();
+    `,
+  );
+}
+
+function runCliWithIncompleteLockMetadata(args: string[], env: NodeJS.ProcessEnv) {
+  return runCliWithPreload(
+    args,
+    env,
+    `
+      const fs = require('node:fs');
+      const { syncBuiltinESMExports } = require('node:module');
+      const originalReadFileSync = fs.readFileSync;
+      fs.readFileSync = (path, options) => {
+        if (String(path).endsWith('.lock')) {
+          return JSON.stringify({ pid: process.pid }) + '\\n';
+        }
+        return originalReadFileSync(path, options);
+      };
+      syncBuiltinESMExports();
+    `,
+  );
+}
+
 function assertLockRecoveryWarning(result: ReturnType<typeof runCli>, lockPath: string): void {
   const output = `${result.stdout}\n${result.stderr}`;
   assert.ok(output.includes(lockPath), `the warning must name ${lockPath}: ${output}`);
   assert.match(output, /\[WARN\]/);
   assert.match(output, /may remain/i);
   assert.match(output, /remove it manually/i);
+  assert.match(output, /usable only when the lock has usable holder metadata and the recorded owner is inactive/i);
   assert.match(output, /APEX_SCRAPER_FORCE_UNLOCK=1/);
+  assert.match(output, /accepts the risk of racing another writer/i);
 }
 
 function waitForChildMessage(child: ChildProcess, expected: string): Promise<void> {
@@ -273,6 +298,29 @@ test('query warns when its writer lock cannot be released', () => {
     assert.equal(result.status, 0, result.stderr || result.stdout);
     assertLockRecoveryWarning(result, lockPath);
     assert.equal(existsSync(lockPath), true, 'the failed release must leave the lock for manual recovery');
+  } finally {
+    rmSync(lockPath, { force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('query warns conditionally when the writer-lock holder metadata is unreadable', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const lockPath = `${dbPath}.lock`;
+
+  try {
+    const result = runCliWithIncompleteLockMetadata(
+      ['query', 'SELECT 1'],
+      cliEnvironment(dbPath, { APEX_SCRAPER_FORCE_UNLOCK: undefined }),
+    );
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assertLockRecoveryWarning(result, lockPath);
+    assert.equal(existsSync(lockPath), true, 'an unknown holder must keep the lock in place');
+    const info = JSON.parse(readFileSync(lockPath, 'utf8')) as WriterLockInfo;
+    assert.equal(typeof info.hostname, 'string');
+    assert.equal(typeof info.token, 'string');
   } finally {
     rmSync(lockPath, { force: true });
     rmSync(dir, { recursive: true, force: true });
@@ -830,6 +878,28 @@ function makeConfig(dir: string): ScraperConfig {
     balanceShards: false,
   };
 }
+
+test('pre-init archive methods reject without creating an archive instance', () => {
+  const dir = makeTmpDir();
+  const jsonRoot = join(dir, 'test_json');
+  const extractor = new UserTokenExtractor(makeConfig(dir), quiet);
+  const source = new ControllableLiveSource();
+
+  try {
+    assert.throws(
+      () => extractor.loadChannelMessages('123456789012345678'),
+      /init.*before archive methods/i,
+    );
+    assert.throws(
+      () => extractor.createLiveCapture(source),
+      /init.*before archive methods/i,
+    );
+    assert.equal(existsSync(jsonRoot), false, 'pre-init archive access must not create the archive root');
+  } finally {
+    extractor.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('a refused extractor does not create its archive directory before lock acquisition', async () => {
   const dir = makeTmpDir();

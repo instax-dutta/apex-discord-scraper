@@ -113,7 +113,7 @@ const CHANNEL_RETRY_DELAY_MS = 2000;
 
 export class UserTokenExtractor {
   private storage!: Storage;
-  private jsonStorage?: JsonStorage;
+  private jsonStorage: JsonStorage | null = null;
   private client: UserTokenClient;
   private fetcher: UserTokenFetcher;
   private log: Logger;
@@ -155,17 +155,21 @@ export class UserTokenExtractor {
     this.fetcher = new UserTokenFetcher(this.client, this.log);
   }
 
-  private getJsonStorage(): JsonStorage {
-    if (this.jsonStorage) return this.jsonStorage;
-
+  private createJsonStorage(): JsonStorage {
     const jsonPath = this.config.dbPath.replace(/\.db$/, '_json');
-    this.jsonStorage = new JsonStorage(jsonPath, this.log, {
+    return new JsonStorage(jsonPath, this.log, {
       chunkSize: this.config.chunkSize,
       pretty: this.config.prettyJson ?? false,
       dedupParts: this.config.archiveDedupParts,
       exactDedup: this.config.exactArchiveDedup,
       maxDedupIds: this.config.archiveDedupMaxIds,
     });
+  }
+
+  private getJsonStorage(): JsonStorage {
+    if (!this.jsonStorage) {
+      throw new Error('UserTokenExtractor must be initialized before archive methods are used. Call init() first.');
+    }
     return this.jsonStorage;
   }
 
@@ -174,14 +178,7 @@ export class UserTokenExtractor {
     // the metadata file and then race this one to overwrite it.
     this.writerLock = acquireWriterLock(this.config.dbPath, this.log);
     try {
-      const jsonPath = this.config.dbPath.replace(/\.db$/, '_json');
-      this.jsonStorage = new JsonStorage(jsonPath, this.log, {
-        chunkSize: this.config.chunkSize,
-        pretty: this.config.prettyJson ?? false,
-        dedupParts: this.config.archiveDedupParts,
-        exactDedup: this.config.exactArchiveDedup,
-        maxDedupIds: this.config.archiveDedupMaxIds,
-      });
+      this.jsonStorage = this.createJsonStorage();
       await this.storage.init();
     } catch (error) {
       if (this.writerLock.release()) this.writerLock = null;
