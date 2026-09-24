@@ -105,6 +105,31 @@ function waitForChildExit(child: ChildProcess): Promise<void> {
   });
 }
 
+function startLockHolder(dbPath: string): ChildProcess {
+  const writerModule = pathToFileURL(join(process.cwd(), 'src', 'writerLock.ts')).href;
+  const childScript = `
+    (async () => {
+      const { acquireWriterLock } = await import(${JSON.stringify(writerModule)});
+      const handle = acquireWriterLock(process.env.LOCK_PATH);
+      process.send?.('locked');
+      process.on('message', (message) => {
+        if (message === 'release') {
+          handle.release();
+          process.exit(0);
+        }
+      });
+    })();
+  `;
+  return spawn(process.execPath, [tsxCli, '-e', childScript], {
+    cwd: process.cwd(),
+    env: cliEnvironment(dbPath, {
+      APEX_SCRAPER_FORCE_UNLOCK: undefined,
+      LOCK_PATH: dbPath,
+    }),
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+}
+
 class ThrowingInfoLogger extends Logger {
   info(): void {
     throw new Error('info logger failure');
@@ -379,6 +404,40 @@ test('release is idempotent and a released lock can be taken again', () => {
   }
 });
 
+test('release reports an incomplete unlink and succeeds on retry', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const handle = acquireWriterLock(dbPath, quiet);
+  const originalUnlinkSync = fs.unlinkSync;
+  let failNextUnlink = true;
+
+  try {
+    mock.method(fs, 'unlinkSync', ((path: Parameters<typeof fs.unlinkSync>[0]) => {
+      if (failNextUnlink) {
+        failNextUnlink = false;
+        throw Object.assign(new Error('injected unlink failure'), { code: 'EACCES' });
+      }
+      return originalUnlinkSync(path);
+    }) as typeof fs.unlinkSync);
+    syncBuiltinESMExports();
+
+    assert.equal(handle.release(), false, 'a failed unlink must report an incomplete release');
+    assert.equal(existsSync(handle.path), true, 'a failed release must leave the lock for retry');
+
+    mock.restoreAll();
+    syncBuiltinESMExports();
+
+    assert.equal(handle.release(), true, 'a retry must report a completed release');
+    assert.equal(existsSync(handle.path), false, 'the retry must remove the lock');
+    assert.equal(handle.release(), true, 'release must remain idempotent');
+  } finally {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+    handle.release();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a dead same-host lock is not automatically reclaimed', () => {
   const dir = makeTmpDir();
   const dbPath = join(dir, 'test.db');
@@ -475,6 +534,27 @@ test('lock ownership is bound to its token across reacquisition', () => {
     assert.notEqual(secondInfo.token, firstInfo.token, 'a new acquisition needs a new ownership token');
     second.release();
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('release leaves unknown holder metadata untouched until a later retry', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const handle = acquireWriterLock(dbPath, quiet);
+  const info = JSON.parse(readFileSync(handle.path, 'utf8')) as WriterLockInfo;
+  const incomplete = `${JSON.stringify({ pid: info.pid, token: info.token })}\n`;
+  writeFileSync(handle.path, incomplete, 'utf8');
+  const before = readFileSync(handle.path, 'utf8');
+
+  try {
+    assert.equal(handle.release(), false, 'an unknown holder must report an incomplete release');
+    assert.equal(readFileSync(handle.path, 'utf8'), before, 'unknown holder metadata must remain untouched');
+    writeFileSync(handle.path, `${JSON.stringify(info)}\n`, 'utf8');
+    assert.equal(handle.release(), true, 'a valid retry must remove the lock');
+    assert.equal(existsSync(handle.path), false);
+  } finally {
+    handle.release();
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -649,6 +729,28 @@ function makeConfig(dir: string): ScraperConfig {
     balanceShards: false,
   };
 }
+
+test('a refused extractor does not create its archive directory before lock acquisition', async () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const jsonRoot = dbPath.replace(/\.db$/, '_json');
+  const child = startLockHolder(dbPath);
+  let extractor: UserTokenExtractor | undefined;
+
+  try {
+    await waitForChildMessage(child, 'locked');
+    extractor = new UserTokenExtractor(makeConfig(dir), quiet);
+    await assert.rejects(() => extractor!.init(), WriterLockError);
+    assert.equal(existsSync(jsonRoot), false, 'a refused extractor must not create the archive directory');
+  } finally {
+    extractor?.close();
+    if (child.exitCode === null && child.signalCode === null) {
+      child.send('release');
+      await waitForChildExit(child).catch(() => undefined);
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('a failed writer-lock release remains retryable through extractor close', async () => {
   const dir = makeTmpDir();

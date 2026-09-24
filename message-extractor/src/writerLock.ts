@@ -56,8 +56,8 @@ export function makeWriterLockCleanupError(
 
 export interface WriterLockHandle {
   readonly path: string;
-  /** Removes the lock file. Idempotent, never throws, and remains retryable after failure. */
-  release(): void;
+  /** Removes the lock file. Returns whether the lock is gone. Never throws. */
+  release(): boolean;
 }
 
 const FORCE_UNLOCK_ENV = 'APEX_SCRAPER_FORCE_UNLOCK';
@@ -192,24 +192,35 @@ function makeWriterLockHandle(lockPath: string, token: string, log?: Logger): Wr
   let released = false;
   return {
     path: lockPath,
-    release() {
-      if (released) return;
+    release(): boolean {
+      if (released) return true;
       try {
         // The token protects normal successor acquisition, but pathname unlink cannot be
         // conditional on it. Manually replacing the file between these steps accepts the
         // same race as the force override.
         const state = readPathState(lockPath);
-        if (state.status !== 'present' || state.holder?.token !== token) {
+        if (state.status === 'missing') {
           released = true;
-          return;
+          return true;
+        }
+        if (state.holder === null) {
+          warnSafely(log, `Could not confirm the owner of the writer lock at ${lockPath}; leaving it for manual recovery`);
+          return false;
+        }
+        if (state.holder.token !== token) {
+          released = true;
+          return true;
         }
         unlinkSync(lockPath);
         released = true;
+        return true;
       } catch (error: any) {
-        if (error?.code === 'ENOENT') released = true;
-        else {
-          warnSafely(log, `Could not remove the writer lock at ${lockPath}: ${error?.message ?? error}`);
+        if (error?.code === 'ENOENT') {
+          released = true;
+          return true;
         }
+        warnSafely(log, `Could not remove the writer lock at ${lockPath}: ${error?.message ?? error}`);
+        return false;
       }
     },
   };

@@ -113,7 +113,7 @@ const CHANNEL_RETRY_DELAY_MS = 2000;
 
 export class UserTokenExtractor {
   private storage!: Storage;
-  private jsonStorage!: JsonStorage;
+  private jsonStorage?: JsonStorage;
   private client: UserTokenClient;
   private fetcher: UserTokenFetcher;
   private log: Logger;
@@ -153,15 +153,20 @@ export class UserTokenExtractor {
       rateLimiter: this.rateLimiter,
     });
     this.fetcher = new UserTokenFetcher(this.client, this.log);
+  }
 
-    const jsonPath = config.dbPath.replace(/\.db$/, '_json');
+  private getJsonStorage(): JsonStorage {
+    if (this.jsonStorage) return this.jsonStorage;
+
+    const jsonPath = this.config.dbPath.replace(/\.db$/, '_json');
     this.jsonStorage = new JsonStorage(jsonPath, this.log, {
-      chunkSize: config.chunkSize,
-      pretty: config.prettyJson ?? false,
-      dedupParts: config.archiveDedupParts,
-      exactDedup: config.exactArchiveDedup,
-      maxDedupIds: config.archiveDedupMaxIds,
+      chunkSize: this.config.chunkSize,
+      pretty: this.config.prettyJson ?? false,
+      dedupParts: this.config.archiveDedupParts,
+      exactDedup: this.config.exactArchiveDedup,
+      maxDedupIds: this.config.archiveDedupMaxIds,
     });
+    return this.jsonStorage;
   }
 
   async init(): Promise<void> {
@@ -169,10 +174,17 @@ export class UserTokenExtractor {
     // the metadata file and then race this one to overwrite it.
     this.writerLock = acquireWriterLock(this.config.dbPath, this.log);
     try {
+      const jsonPath = this.config.dbPath.replace(/\.db$/, '_json');
+      this.jsonStorage = new JsonStorage(jsonPath, this.log, {
+        chunkSize: this.config.chunkSize,
+        pretty: this.config.prettyJson ?? false,
+        dedupParts: this.config.archiveDedupParts,
+        exactDedup: this.config.exactArchiveDedup,
+        maxDedupIds: this.config.archiveDedupMaxIds,
+      });
       await this.storage.init();
     } catch (error) {
-      this.writerLock.release();
-      this.writerLock = null;
+      if (this.writerLock.release()) this.writerLock = null;
       throw error;
     }
   }
@@ -250,7 +262,7 @@ export class UserTokenExtractor {
     }
 
     const progress = await this.storage.getOrCreateProgress(channelId, guildId, channelName);
-    const existingArchive = this.jsonStorage.loadArchive(channelId) ?? undefined;
+    const existingArchive = this.getJsonStorage().loadArchive(channelId) ?? undefined;
     const alreadyDone = progress.status === 'done' && !!existingArchive?.completedAt;
 
     // Auto-incremental: resuming an already-finished channel is a no-op, so a
@@ -473,7 +485,7 @@ export class UserTokenExtractor {
         // archive already has (the crash window: written but not acknowledged
         // when the process died) are dropped rather than stored twice, so the
         // run's counters must come from the storage layer, not the batch size.
-        const { written, skipped } = this.jsonStorage.appendMessages(channelId, channelName, toFlush);
+        const { written, skipped } = this.getJsonStorage().appendMessages(channelId, channelName, toFlush);
 
         // Written here (not as messages arrive) so the export is ordered, is
         // only ever ahead of nothing the archive already has, and shares the
@@ -595,7 +607,7 @@ export class UserTokenExtractor {
       const complete = !fetchResult.aborted && failedShards === 0 && isResumeComplete(durableResumeState);
 
       if (complete) {
-        this.jsonStorage.completeArchive(channelId);
+        this.getJsonStorage().completeArchive(channelId);
       }
 
       const cumulative = baseExtracted + sessionExtracted;
@@ -604,8 +616,8 @@ export class UserTokenExtractor {
       // newest id so a later incremental catch-up (or live session) knows
       // where to start. The resume state was persisted by the final flush
       // above, so nothing this run wrote can be re-fetched after this point.
-      this.jsonStorage.finalizeChannel(channelId);
-      const archive = this.jsonStorage.loadArchive(channelId);
+      this.getJsonStorage().finalizeChannel(channelId);
+      const archive = this.getJsonStorage().loadArchive(channelId);
       const duration = Date.now() - startTime;
 
       await this.storage.updateProgress(channelId, {
@@ -678,7 +690,7 @@ export class UserTokenExtractor {
         success: false,
         messagesExtracted: sessionExtracted,
         duplicatesSkipped,
-        jsonParts: this.jsonStorage.loadArchive(channelId)?.totalParts || 0,
+        jsonParts: this.getJsonStorage().loadArchive(channelId)?.totalParts || 0,
         duration,
         error: error?.message ?? String(error),
         errorKind: kind ?? 'unknown',
@@ -881,7 +893,7 @@ export class UserTokenExtractor {
     const capture = new LiveCapture({
       ...options,
       storage: this.storage,
-      jsonStorage: this.jsonStorage,
+      jsonStorage: this.getJsonStorage(),
       source,
       log: this.log,
       batchMessages: options.batchMessages ?? this.config.liveBatchMessages,
@@ -906,15 +918,15 @@ export class UserTokenExtractor {
   }
 
   loadChannelMessages(channelId: string): ExportRow[] {
-    return this.jsonStorage.loadAllMessages(channelId);
+    return this.getJsonStorage().loadAllMessages(channelId);
   }
 
   exportChannelToJson(channelId: string, outputPath: string): number {
-    return this.jsonStorage.exportToSingleJson(channelId, outputPath);
+    return this.getJsonStorage().exportToSingleJson(channelId, outputPath);
   }
 
   exportChannelToJsonl(channelId: string, outputPath: string): number {
-    return this.jsonStorage.exportToJsonl(channelId, outputPath);
+    return this.getJsonStorage().exportToJsonl(channelId, outputPath);
   }
 
   /**
@@ -922,12 +934,12 @@ export class UserTokenExtractor {
    * `status` can report it without reading or building anything.
    */
   estimateDedupCost(channelId: string): DedupCostEstimate | null {
-    return this.jsonStorage.estimateDedupCost(channelId);
+    return this.getJsonStorage().estimateDedupCost(channelId);
   }
 
   /** How the archive guard is configured. */
   getDedupConfig(): { exact: boolean; parts: number; maxIds: number } {
-    return this.jsonStorage.dedupConfig;
+    return this.getJsonStorage().dedupConfig;
   }
 
   /**
@@ -936,7 +948,7 @@ export class UserTokenExtractor {
    * `status`.
    */
   private describeDedup(channelId: string): string {
-    const stats = this.jsonStorage.getDedupStats(channelId);
+    const stats = this.getJsonStorage().getDedupStats(channelId);
     if (!stats) return '';
 
     const ids = stats.ids.toLocaleString('en-US');
@@ -954,8 +966,8 @@ export class UserTokenExtractor {
     sizeBytes: number;
     isComplete: boolean;
   } | null {
-    const archive = this.jsonStorage.loadArchive(channelId);
-    const stats = this.jsonStorage.getStorageStats(channelId);
+    const archive = this.getJsonStorage().loadArchive(channelId);
+    const stats = this.getJsonStorage().getStorageStats(channelId);
     if (!archive) return null;
     return {
       messages: archive.totalMessages,
@@ -1019,7 +1031,7 @@ export class UserTokenExtractor {
       // the reset just deleted instead of re-extracting it.
       newest_message_id: null,
     });
-    this.jsonStorage.deleteAllChunks(channelId);
+    this.getJsonStorage().deleteAllChunks(channelId);
     this.log.info(`Reset all data for channel ${channelId}`);
   }
 
@@ -1035,7 +1047,7 @@ export class UserTokenExtractor {
       this.storage.close();
     } finally {
       // A cleanup failure must not leave the data directory locked until manual removal.
-      this.writerLock?.release();
+      if (this.writerLock?.release()) this.writerLock = null;
     }
   }
 }
