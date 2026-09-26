@@ -4,6 +4,44 @@ Headless multi-channel Discord message extractor that runs on any server. Extrac
 
 This tool uses the same authentication method as the Vencord FetchChannelMessages plugin - it piggybacks on your logged-in user session to access channels.
 
+[![CI](https://github.com/instax-dutta/apex-discord-scraper/actions/workflows/ci.yml/badge.svg)](https://github.com/instax-dutta/apex-discord-scraper/actions/workflows/ci.yml)
+[![Node](https://img.shields.io/badge/node-%3E%3D18.15-brightgreen.svg)](https://nodejs.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![npm](https://img.shields.io/npm/v/apex-discord-scraper.svg)](https://www.npmjs.com/package/apex-discord-scraper)
+
+## :warning: Read this before you use it
+
+**Using a Discord user token breaks Discord's Terms of Service.** Automating a
+user account - which is what this tool does, the same way the Vencord
+FetchChannelMessages plugin does - is called *self-botting*. Discord terminates
+accounts that do it. There is no setting, flag, or configuration that makes this
+safe. Depending on your account and how you use it, the likely outcomes are:
+
+- your account is disabled, and you lose the archive you built from it
+- your token is revoked mid-run, and the extraction stops
+- you are rate limited or IP banned, and so is everyone else on your connection
+
+What you accept by continuing:
+
+- **You** are responsible for how you use this, and for complying with Discord's
+  terms and with the server's own rules. Extracting a channel you are in is not
+  the same as having permission to keep or redistribute it.
+- **Extracted messages are other people's data.** An archive is a copy of what
+  other users wrote. Deleting your account does not delete the copy you already
+  downloaded. Do not publish someone's messages without their consent.
+- **A user token is a password.** It grants full access to your account, including
+  everything you can do in Discord. Treat it accordingly, and see
+  [SECURITY.md](SECURITY.md).
+
+**Prefer a bot token.** `DISCORD_BOT_TOKEN` is fully supported and does not
+violate the terms. The only reason this tool exists is that reading a channel's
+history usually requires the bot to already be in the server, which is not
+something you can add yourself. If you can get a bot invited with read access,
+do that instead - it is the supported path.
+
+If any of that is a dealbreaker, do not use this tool. It is provided as-is, with
+no warranty, by someone who is not responsible for what you do with it.
+
 ## Modes at a glance
 
 Every mode writes into **one shared archive per channel**, so you can mix them
@@ -76,7 +114,8 @@ You're a member of a Discord server (not an admin) and want to extract and analy
 ### 2. Install Dependencies
 
 ```bash
-cd message-extractor
+git clone https://github.com/instax-dutta/apex-discord-scraper.git
+cd apex-discord-scraper
 npm install
 ```
 
@@ -975,8 +1014,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/apex-scraper/message-extractor
-EnvironmentFile=/opt/apex-scraper/message-extractor/.env
+WorkingDirectory=/opt/apex-discord-scraper
+EnvironmentFile=/opt/apex-discord-scraper/.env
 ExecStart=/usr/bin/npm run watch -- --interval 15 --concurrency 2
 Restart=always
 RestartSec=30
@@ -996,7 +1035,7 @@ journalctl -u apex-watch -f
 **cron** (one-shot cycles instead of a long-running process):
 
 ```cron
-*/15 * * * * cd /opt/apex-scraper/message-extractor && npm run watch -- --once >> /var/log/apex-watch.log 2>&1
+*/15 * * * * cd /opt/apex-discord-scraper && npm run watch -- --once >> /var/log/apex-watch.log 2>&1
 ```
 
 `--once` exits `1` if any channel failed, so cron will mail you on failures if
@@ -1060,8 +1099,8 @@ the global request budget.
 ssh user@your-server
 
 # Clone and setup
-git clone https://github.com/your-repo/apex-scraper.git
-cd apex-scraper
+git clone https://github.com/instax-dutta/apex-discord-scraper.git
+cd apex-discord-scraper
 npm install
 
 # Configure
@@ -1074,21 +1113,28 @@ npm run extract -- <channel_id>
 
 ### Docker (Optional)
 
-```dockerfile
-FROM node:20-slim
-
-WORKDIR /app
-COPY package*.json ./
-RUN npm install
-
-COPY . .
-CMD ["npm", "start"]
-```
+The bundled `Dockerfile` is a two-stage build: it compiles the TypeScript in the
+image, so it works from a fresh clone where `dist/` does not exist yet, and the
+runtime stage carries only the compiled output and the production dependency
+tree.
 
 ```bash
 docker build -t apex-scraper .
-docker run -v $(pwd)/data:/app/data -e DISCORD_USER_TOKEN=your_token apex-scraper extract <channel_id>
+
+# The archive lives on a host volume, never inside the image.
+docker run --rm \
+  -v "$(pwd)/data:/app/data" \
+  -e DISCORD_USER_TOKEN="$DISCORD_USER_TOKEN" \
+  apex-scraper extract <channel_id>
 ```
+
+Prefer passing the token as an environment variable from your shell, as above, or
+via `--env-file`. Do not write it into a `Dockerfile`, and do not `docker cp` a
+`.env` into a running container.
+
+`.dockerignore` keeps `.env`, `.env.*` and `data/` out of the build context, so a
+local `.env` or a private archive cannot be baked into an image layer by
+accident. If you edit the `Dockerfile`, keep that guarantee intact.
 
 ## Limitations
 
@@ -1113,11 +1159,14 @@ docker run -v $(pwd)/data:/app/data -e DISCORD_USER_TOKEN=your_token apex-scrape
   or a short `watch` interval) if that matters to you.
 - **No permissions interception**: If you lose access to a channel, catch-ups and live capture for
   it start failing with `403`. The failure is reported and does not affect other channels.
-- **User tokens are against Discord's ToS**: The same gray area as every browser extension. Your
-  token grants full account access - treat it like a password.
+- **User tokens are against Discord's ToS**: Automating a user account gets accounts terminated.
+  See the [warning at the top of this file](#warning-read-this-before-you-use-it) before continuing.
 - **Bot tokens work but are rarely useful here**: `DISCORD_BOT_TOKEN` is supported as an
-  alternative, but it requires a bot that is already in the server with read access, which is
-  exactly what most users of this tool do not have.
+  alternative, and is the ToS-safe path, but it requires a bot that is already in the server with
+  read access, which is exactly what most users of this tool do not have.
+- **The archive is private data**: `./data/` holds other people's messages. It is gitignored and
+  excluded from the Docker build context, but that only keeps it out of the repository and the
+  image. Do not publish it without the consent of the people whose messages it contains.
 
 ## Getting Help
 
@@ -1126,6 +1175,22 @@ docker run -v $(pwd)/data:/app/data -e DISCORD_USER_TOKEN=your_token apex-scrape
 - Try a smaller channel first to verify setup
 - Use `LOG_LEVEL=debug` in .env for verbose output
 
+For anything else:
+
+- [Issues](https://github.com/instax-dutta/apex-discord-scraper/issues) for bugs and feature
+  requests. Redact your `.env` and never include a token.
+- [CONTRIBUTING.md](CONTRIBUTING.md) to build, test, and send a pull request.
+- [SECURITY.md](SECURITY.md) to report a vulnerability privately, or for how to handle your token.
+
+## Contributing
+
+Contributions are welcome. The test suite is fully offline - no Discord token is
+needed to work on this - and `npm run build` plus `npm test` are what CI runs on
+Node 18, 20, and 22. Please read [CONTRIBUTING.md](CONTRIBUTING.md) first; it
+covers the project's low-dependency rule and what a good test looks like here.
+
+Participation is governed by [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
 ## License
 
-MIT
+MIT - see [LICENSE](LICENSE).

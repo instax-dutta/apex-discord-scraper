@@ -1,0 +1,27 @@
+# Secrets must never enter the build context or an image layer.
+.env
+.env.*
+!.env.example
+
+# Private archives: SQLite metadata plus extracted Discord messages.
+data/
+
+node_modules/
+dist/
+npm-debug.log*
+*.log
+
+.git/
+.github/
+.gitignore
+.worktrees/
+.superpowers/
+
+# Not needed to build
+test/
+docs/
+.editorconfig
+CONTRIBUTING.md
+CODE_OF_CONDUCT.md
+SECURITY.md
+README.md

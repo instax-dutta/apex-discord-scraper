@@ -1,8 +1,28 @@
+# Dependencies
 node_modules/
+
+# Build output
 dist/
+
+# Local archive: SQLite metadata + extracted Discord messages.
+# This is private data pulled from other people's accounts. Never commit it.
 data/
+
+# Secrets. Keep only .env.example, which must never contain real values.
 .env
+.env.*
+!.env.example
+
+# Logs
 *.log
+npm-debug.log*
+
+# Editor / OS
 .DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Agent scratch space
 .worktrees/
 .superpowers/

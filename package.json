@@ -1,0 +1,64 @@
+{
+  "name": "apex-discord-scraper",
+  "version": "1.0.0",
+  "description": "Headless multi-channel Discord message extractor. Time-sharded parallel backfill, resumable extraction, live Gateway capture, and chunked JSON archives.",
+  "type": "module",
+  "bin": {
+    "apex-scraper": "./dist/cli.js"
+  },
+  "main": "./dist/cli.js",
+  "files": [
+    "dist",
+    "schema.sql",
+    ".env.example"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/cli.js",
+    "dev": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test \"test/*.test.ts\"",
+    "prepublishOnly": "npm run build",
+    "extract": "tsx src/cli.ts extract",
+    "live": "tsx src/cli.ts live",
+    "watch": "tsx src/cli.ts watch",
+    "validate": "tsx src/cli.ts validate",
+    "list": "tsx src/cli.ts list",
+    "status": "tsx src/cli.ts status",
+    "dump": "tsx src/cli.ts dump",
+    "reset": "tsx src/cli.ts reset",
+    "query": "tsx src/cli.ts query"
+  },
+  "keywords": [
+    "discord",
+    "scraper",
+    "archive",
+    "messages",
+    "extractor",
+    "headless",
+    "backup",
+    "gateway"
+  ],
+  "author": "R4C3R0P",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/instax-dutta/apex-discord-scraper.git"
+  },
+  "bugs": {
+    "url": "https://github.com/instax-dutta/apex-discord-scraper/issues"
+  },
+  "homepage": "https://github.com/instax-dutta/apex-discord-scraper#readme",
+  "dependencies": {
+    "sql.js": "^1.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.5",
+    "@types/sql.js": "^1.4.9",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=18.15.0"
+  }
+}

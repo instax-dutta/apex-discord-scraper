@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['18', '20', '22']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Smoke test the built CLI
+        run: node dist/cli.js --help
+
+  docker:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: apex-scraper:ci
+
+      - name: Confirm the image holds no secrets and no archive
+        run: |
+          set -eu
+          # No .env may exist in the image.
+          if docker run --rm --entrypoint sh apex-scraper:ci -c 'test -e /app/.env'; then
+            echo "::error::a .env must never exist in the image"
+            exit 1
+          fi
+          # /app/data exists because the Dockerfile declares it as a volume, so
+          # check for archive *content* rather than the directory itself.
+          if docker run --rm --entrypoint sh apex-scraper:ci -c \
+            'ls -A /app/data | grep -q . || test -e /app/apex-scraper.db'; then
+            echo "::error::the image must not carry a pre-populated archive"
+            exit 1
+          fi
+          # No raw TypeScript sources or tests should ship in the runtime image.
+          if docker run --rm --entrypoint sh apex-scraper:ci -c 'test -d /app/src || test -d /app/test'; then
+            echo "::error::sources or tests must not be present in the runtime image"
+            exit 1
+          fi
+          # `status` must fail cleanly without credentials, not hang or crash.
+          if docker run --rm apex-scraper:ci status; then
+            echo "::error::status should exit non-zero without a token"
+            exit 1
+          fi
+          docker run --rm apex-scraper:ci status 2>&1 | grep -q "DISCORD_USER_TOKEN"
