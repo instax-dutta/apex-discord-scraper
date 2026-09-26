@@ -17,7 +17,7 @@
     "start": "node dist/cli.js",
     "dev": "tsx src/cli.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test \"test/*.test.ts\"",
+    "test": "tsx --test test/*.test.ts",
     "prepublishOnly": "npm run build",
     "extract": "tsx src/cli.ts extract",
     "live": "tsx src/cli.ts live",

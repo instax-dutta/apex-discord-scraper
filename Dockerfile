@@ -29,8 +29,10 @@ ENV NODE_OPTIONS="--expose-gc"
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/package.json ./
-COPY --from=build /app/schema.sql ./
-COPY .env.example ./
+# Reference material for operators, taken from the build context. .dockerignore
+# keeps .env, .env.* and data/ out of that context, so neither a local token nor
+# a private archive can reach an image layer through this stage.
+COPY schema.sql .env.example ./
 
 # The archive lives on a volume, never in the image layer.
 RUN mkdir -p /app/data && chown -R node:node /app/data
