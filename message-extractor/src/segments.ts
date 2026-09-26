@@ -98,7 +98,7 @@ export function balanceSegmentsByDensity(
 
   if (p < 2) {
     return {
-      segments: [{ after: channelId, before: tsToSnowflake(end) }],
+      segments: [{ after: channelId, before: tsToSnowflake(end), afterInclusive: true }],
       strategy: 'equal-time',
       imbalance: null,
       loads: null,
@@ -162,8 +162,8 @@ export function balanceSegmentsByDensity(
   if (fractional.length !== p + 1) return equalFallback(channelId, p);
 
   // Snap to integer milliseconds. Adjacent shards share the exact same
-  // boundary value, so with strict `id > after && id < before` filtering they
-  // neither overlap nor leave a gap.
+  // boundary value, so each window is half-open - `id >= after && id < before` -
+  // and a message on the boundary belongs to exactly one of them.
   const bounds = fractional.map((t, i) => {
     if (i === 0) return start;
     if (i === fractional.length - 1) return end;
@@ -179,6 +179,7 @@ export function balanceSegmentsByDensity(
     segments.push({
       after: i === 0 ? channelId : tsToSnowflake(bounds[i]),
       before: tsToSnowflake(bounds[i + 1]),
+      afterInclusive: true,
     });
   }
 

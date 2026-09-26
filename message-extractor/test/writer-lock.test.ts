@@ -1,0 +1,1059 @@
+// Cross-process writer lock tests.
+// Run with: npm test
+
+import { mock, test } from 'node:test';
+import assert from 'node:assert/strict';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import fs, { mkdtempSync, mkdirSync, rmSync, unlinkSync, symlinkSync, writeFileSync, existsSync, readFileSync } from 'fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { tmpdir, hostname } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+import { Storage } from '../src/storage.js';
+import { acquireWriterLock, makeWriterLockCleanupError, WriterLockCleanupError, WriterLockError, type WriterLockInfo } from '../src/writerLock.js';
+import { UserTokenExtractor } from '../src/userTokenExtractor.js';
+import type { LiveCapture, LiveMessageSource } from '../src/liveCapture.js';
+import type { DiscordMessage, ScraperConfig } from '../src/types.js';
+import { Logger } from '../src/utils.js';
+
+const quiet = new Logger('error');
+const require = createRequire(import.meta.url);
+const tsxCli = require.resolve('tsx/cli');
+
+function cliEnvironment(
+  dbPath: string,
+  overrides: Record<string, string | undefined> = {},
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    DISCORD_USER_TOKEN: 'test-token',
+    DISCORD_BOT_TOKEN: '',
+    DB_PATH: dbPath,
+    LOG_LEVEL: 'error',
+  };
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === undefined) delete env[key];
+    else env[key] = value;
+  }
+  return env;
+}
+
+function runCli(args: string[], env: NodeJS.ProcessEnv) {
+  const result = spawnSync(process.execPath, [tsxCli, 'src/cli.ts', ...args], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    env,
+  });
+  assert.ifError(result.error);
+  return result;
+}
+
+function runCliWithPreload(args: string[], env: NodeJS.ProcessEnv, source: string) {
+  const preloadDir = makeTmpDir();
+  const preloadPath = join(preloadDir, 'release-failure.cjs');
+  writeFileSync(preloadPath, source, 'utf8');
+
+  try {
+    return runCli(args, {
+      ...env,
+      NODE_OPTIONS: `${env.NODE_OPTIONS ? `${env.NODE_OPTIONS} ` : ''}--require=${preloadPath}`,
+    });
+  } finally {
+    rmSync(preloadDir, { recursive: true, force: true });
+  }
+}
+
+function runCliWithUnlinkFailure(args: string[], env: NodeJS.ProcessEnv) {
+  return runCliWithPreload(
+    args,
+    env,
+    `
+      const fs = require('node:fs');
+      const { syncBuiltinESMExports } = require('node:module');
+      fs.unlinkSync = () => {
+        throw Object.assign(new Error('injected unlink failure'), { code: 'EACCES' });
+      };
+      syncBuiltinESMExports();
+    `,
+  );
+}
+
+function runCliWithIncompleteLockMetadata(args: string[], env: NodeJS.ProcessEnv) {
+  return runCliWithPreload(
+    args,
+    env,
+    `
+      const fs = require('node:fs');
+      const { syncBuiltinESMExports } = require('node:module');
+      const originalReadFileSync = fs.readFileSync;
+      fs.readFileSync = (path, options) => {
+        if (String(path).endsWith('.lock')) {
+          return JSON.stringify({ pid: process.pid }) + '\\n';
+        }
+        return originalReadFileSync(path, options);
+      };
+      syncBuiltinESMExports();
+    `,
+  );
+}
+
+function assertLockRecoveryWarning(result: ReturnType<typeof runCli>, lockPath: string): void {
+  const output = `${result.stdout}\n${result.stderr}`;
+  assert.ok(output.includes(lockPath), `the warning must name ${lockPath}: ${output}`);
+  assert.match(output, /\[WARN\]/);
+  assert.match(output, /may remain/i);
+  assert.match(output, /remove it manually/i);
+  assert.match(output, /usable only when the lock has usable holder metadata and the recorded owner is inactive/i);
+  assert.match(output, /APEX_SCRAPER_FORCE_UNLOCK=1/);
+  assert.match(output, /accepts the risk of racing another writer/i);
+}
+
+function waitForChildMessage(child: ChildProcess, expected: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timed out waiting for child message ${expected}`));
+    }, 10_000);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      child.off('message', onMessage);
+      child.off('error', onError);
+      child.off('exit', onExit);
+    };
+    const onMessage = (message: unknown) => {
+      if (message !== expected) return;
+      cleanup();
+      resolve();
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      reject(new Error(`Lock holder exited before sending ${expected} (code=${code}, signal=${signal})`));
+    };
+    child.on('message', onMessage);
+    child.once('error', onError);
+    child.once('exit', onExit);
+  });
+}
+
+function waitForChildExit(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('Timed out waiting for lock holder to exit'));
+    }, 10_000);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      child.off('error', onError);
+      child.off('exit', onExit);
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onExit = () => {
+      cleanup();
+      resolve();
+    };
+    child.once('error', onError);
+    child.once('exit', onExit);
+  });
+}
+
+function startLockHolder(dbPath: string): ChildProcess {
+  const writerModule = pathToFileURL(join(process.cwd(), 'src', 'writerLock.ts')).href;
+  const childScript = `
+    (async () => {
+      const { acquireWriterLock } = await import(${JSON.stringify(writerModule)});
+      const handle = acquireWriterLock(process.env.LOCK_PATH);
+      process.send?.('locked');
+      process.on('message', (message) => {
+        if (message === 'release') {
+          handle.release();
+          process.exit(0);
+        }
+      });
+    })();
+  `;
+  return spawn(process.execPath, [tsxCli, '-e', childScript], {
+    cwd: process.cwd(),
+    env: cliEnvironment(dbPath, {
+      APEX_SCRAPER_FORCE_UNLOCK: undefined,
+      LOCK_PATH: dbPath,
+    }),
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+}
+
+class ThrowingInfoLogger extends Logger {
+  info(): void {
+    throw new Error('info logger failure');
+  }
+}
+
+class ThrowingWarnLogger extends Logger {
+  warn(): void {
+    throw new Error('warn logger failure');
+  }
+}
+
+class ControllableLiveSource implements LiveMessageSource {
+  private handler: ((message: DiscordMessage) => void) | null = null;
+  closeCalls = 0;
+
+  onMessage(handler: (message: DiscordMessage) => void): void {
+    this.handler = handler;
+  }
+
+  async start(): Promise<void> {}
+
+  close(): void {
+    this.closeCalls++;
+  }
+
+  emit(message: DiscordMessage): void {
+    this.handler?.(message);
+  }
+}
+
+function makeTmpDir(): string {
+  return mkdtempSync(join(tmpdir(), 'apex-lock-'));
+}
+
+/** A pid that has definitely exited, so liveness checks report it as dead. */
+function deadPid(): number {
+  const child = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+  assert.ok(typeof child.pid === 'number' && child.pid > 0, 'could not spawn a disposable process');
+  return child.pid!;
+}
+
+function writeLock(dbPath: string, info: Partial<WriterLockInfo>): string {
+  const lockPath = `${dbPath}.lock`;
+  writeFileSync(
+    lockPath,
+    `${JSON.stringify({
+      pid: process.pid,
+      hostname: hostname(),
+      acquiredAt: new Date().toISOString(),
+      command: 'test',
+      token: 'test-token',
+      ...info,
+    })}\n`,
+    'utf-8',
+  );
+  return lockPath;
+}
+
+test('acquiring a lock creates its missing parent directory', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'nested', 'archive.db');
+
+  try {
+    const handle = acquireWriterLock(dbPath, quiet);
+    assert.equal(existsSync(handle.path), true);
+    handle.release();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('query is refused while another process owns the writer lock', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const owner = acquireWriterLock(dbPath, quiet);
+
+  try {
+    const before = readFileSync(owner.path, 'utf8');
+    const result = runCli(
+      ['query', 'SELECT 1'],
+      cliEnvironment(dbPath, { APEX_SCRAPER_FORCE_UNLOCK: undefined }),
+    );
+
+    assert.equal(result.status, 1, result.stderr || result.stdout);
+    assert.match(result.stderr, /Only one process may write a data directory/);
+    assert.equal(existsSync(owner.path), true, 'the refusal must leave the lock in place');
+    assert.equal(readFileSync(owner.path, 'utf8'), before, 'the refusal must not replace the lock');
+  } finally {
+    owner.release();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('query warns when its writer lock cannot be released', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const lockPath = `${dbPath}.lock`;
+
+  try {
+    const result = runCliWithUnlinkFailure(
+      ['query', 'SELECT 1'],
+      cliEnvironment(dbPath, { APEX_SCRAPER_FORCE_UNLOCK: undefined }),
+    );
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assertLockRecoveryWarning(result, lockPath);
+    assert.equal(existsSync(lockPath), true, 'the failed release must leave the lock for manual recovery');
+  } finally {
+    rmSync(lockPath, { force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('query warns conditionally when the writer-lock holder metadata is unreadable', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const lockPath = `${dbPath}.lock`;
+
+  try {
+    const result = runCliWithIncompleteLockMetadata(
+      ['query', 'SELECT 1'],
+      cliEnvironment(dbPath, { APEX_SCRAPER_FORCE_UNLOCK: undefined }),
+    );
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assertLockRecoveryWarning(result, lockPath);
+    assert.equal(existsSync(lockPath), true, 'an unknown holder must keep the lock in place');
+    const info = JSON.parse(readFileSync(lockPath, 'utf8')) as WriterLockInfo;
+    assert.equal(typeof info.hostname, 'string');
+    assert.equal(typeof info.token, 'string');
+  } finally {
+    rmSync(lockPath, { force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an initialized command warns when its writer lock cannot be released', async () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const lockPath = `${dbPath}.lock`;
+  const storage = new Storage(dbPath, quiet);
+
+  try {
+    await storage.init();
+    storage.close();
+
+    const result = runCliWithUnlinkFailure(
+      ['status'],
+      cliEnvironment(dbPath, { APEX_SCRAPER_FORCE_UNLOCK: undefined }),
+    );
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assertLockRecoveryWarning(result, lockPath);
+    assert.equal(existsSync(lockPath), true, 'the failed release must leave the lock for manual recovery');
+  } finally {
+    storage.close();
+    rmSync(lockPath, { force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an initialized command warns when init cleanup cannot release its lock', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const lockPath = `${dbPath}.lock`;
+  mkdirSync(dbPath, { recursive: true });
+
+  try {
+    const result = runCliWithUnlinkFailure(
+      ['status'],
+      cliEnvironment(dbPath, { APEX_SCRAPER_FORCE_UNLOCK: undefined }),
+    );
+
+    assert.equal(result.status, 1, result.stderr || result.stdout);
+    assertLockRecoveryWarning(result, lockPath);
+    assert.equal(existsSync(lockPath), true, 'the failed release must leave the lock for manual recovery');
+  } finally {
+    rmSync(lockPath, { force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an independent process can hold the lock and refuse the parent', async () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const lockPath = `${dbPath}.lock`;
+  const writerModule = pathToFileURL(join(process.cwd(), 'src', 'writerLock.ts')).href;
+  const childScript = `
+    (async () => {
+      const { acquireWriterLock } = await import(${JSON.stringify(writerModule)});
+      const handle = acquireWriterLock(process.env.LOCK_PATH);
+      process.send?.('locked');
+      process.on('message', (message) => {
+        if (message === 'release') {
+          handle.release();
+          process.exit(0);
+        }
+      });
+    })();
+  `;
+  const previousOverride = process.env.APEX_SCRAPER_FORCE_UNLOCK;
+  delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+  const child = spawn(process.execPath, [tsxCli, '-e', childScript], {
+    cwd: process.cwd(),
+    env: cliEnvironment(dbPath, {
+      APEX_SCRAPER_FORCE_UNLOCK: undefined,
+      LOCK_PATH: dbPath,
+    }),
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+  let childError = '';
+  child.stderr?.on('data', (chunk) => {
+    childError += String(chunk);
+  });
+
+  try {
+    await waitForChildMessage(child, 'locked');
+    const before = readFileSync(lockPath, 'utf8');
+    assert.throws(
+      () => acquireWriterLock(dbPath, quiet),
+      (error: unknown) => {
+        assert.ok(error instanceof WriterLockError);
+        assert.equal(typeof error.holder?.pid, 'number');
+        assert.notEqual(error.holder?.pid, process.pid);
+        return true;
+      },
+    );
+    assert.equal(existsSync(lockPath), true, 'the parent must not remove the child lock');
+    assert.equal(readFileSync(lockPath, 'utf8'), before, 'the parent must not replace the child lock');
+
+    child.send('release');
+    await waitForChildExit(child);
+    assert.equal(existsSync(lockPath), false, 'the child should remove its lock on release');
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGTERM');
+      await waitForChildExit(child).catch(() => undefined);
+    }
+    if (previousOverride === undefined) delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+    else process.env.APEX_SCRAPER_FORCE_UNLOCK = previousOverride;
+    rmSync(dir, { recursive: true, force: true });
+    assert.equal(childError.includes('Unhandled'), false, childError);
+  }
+});
+
+test('a post-init CLI failure releases the writer lock', async () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const lockPath = `${dbPath}.lock`;
+  const jsonRoot = dbPath.replace(/\.db$/, '_json');
+  const channelId = '123456789012345678';
+  const storage = new Storage(dbPath, quiet);
+
+  try {
+    await storage.init();
+    await storage.getOrCreateProgress(channelId, 'guild-1', 'channel');
+    storage.close();
+    mkdirSync(jsonRoot, { recursive: true });
+    writeFileSync(join(jsonRoot, channelId), 'not a directory', 'utf8');
+
+    const result = runCli(
+      ['status'],
+      cliEnvironment(dbPath, { APEX_SCRAPER_FORCE_UNLOCK: undefined }),
+    );
+
+    assert.equal(result.status, 1, result.stderr || result.stdout);
+    assert.match(result.stderr, /not a directory|ENOTDIR/i);
+    assert.equal(existsSync(lockPath), false, 'the failed command must release its lock');
+  } finally {
+    storage.close();
+    rmSync(lockPath, { force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the force-unlock override is loaded from .env unless the real environment overrides it', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const lockPath = `${dbPath}.lock`;
+  const envPath = join(process.cwd(), '.env');
+  const originalEnv = existsSync(envPath) ? readFileSync(envPath, 'utf8') : null;
+
+  try {
+    writeFileSync(
+      envPath,
+      `${originalEnv ?? ''}${originalEnv ? '\n' : ''}APEX_SCRAPER_FORCE_UNLOCK=1\n`,
+      'utf8',
+    );
+    writeLock(dbPath, { pid: deadPid(), hostname: hostname(), token: 'stale-file-env-lock' });
+
+    const fromFile = runCli(
+      ['query', 'SELECT 1'],
+      cliEnvironment(dbPath, { APEX_SCRAPER_FORCE_UNLOCK: undefined }),
+    );
+    assert.equal(fromFile.status, 0, fromFile.stderr || fromFile.stdout);
+    assert.equal(existsSync(lockPath), false, '.env override should reclaim and release the stale lock');
+
+    writeLock(dbPath, { pid: deadPid(), hostname: hostname(), token: 'stale-real-env-lock' });
+    const before = readFileSync(lockPath, 'utf8');
+    const fromRealEnv = runCli(
+      ['query', 'SELECT 1'],
+      cliEnvironment(dbPath, { APEX_SCRAPER_FORCE_UNLOCK: '0' }),
+    );
+
+    assert.equal(fromRealEnv.status, 1, fromRealEnv.stderr || fromRealEnv.stdout);
+    assert.equal(readFileSync(lockPath, 'utf8'), before, 'the real environment must win over .env');
+  } finally {
+    if (originalEnv === null) rmSync(envPath, { force: true });
+    else writeFileSync(envPath, originalEnv, 'utf8');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a second writer is refused while the lock is held, and allowed after release', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+
+  try {
+    const first = acquireWriterLock(dbPath, quiet);
+    assert.equal(first.path, `${dbPath}.lock`);
+    assert.ok(existsSync(first.path), 'the lock file should exist while held');
+    const before = readFileSync(first.path, 'utf8');
+
+    assert.throws(
+      () => acquireWriterLock(dbPath, quiet),
+      (error: unknown) => {
+        assert.ok(error instanceof WriterLockError, 'expected a WriterLockError');
+        assert.equal(error.lockPath, `${dbPath}.lock`);
+        assert.equal(error.holder?.pid, process.pid, 'the error should name the holder');
+        assert.match(error.message, /Only one process may write a data directory/);
+        return true;
+      },
+    );
+    assert.equal(existsSync(first.path), true, 'the refusal must leave the lock in place');
+    assert.equal(readFileSync(first.path, 'utf8'), before, 'the refusal must not replace the lock');
+
+    first.release();
+    assert.equal(existsSync(first.path), false, 'release must remove the lock file');
+
+    const second = acquireWriterLock(dbPath, quiet);
+    second.release();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('release is idempotent and a released lock can be taken again', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+
+  try {
+    const handle = acquireWriterLock(dbPath, quiet);
+    handle.release();
+    handle.release();
+
+    const again = acquireWriterLock(dbPath, quiet);
+    again.release();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('release reports an incomplete unlink and succeeds on retry', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const handle = acquireWriterLock(dbPath, quiet);
+  const originalUnlinkSync = fs.unlinkSync;
+  let failNextUnlink = true;
+
+  try {
+    mock.method(fs, 'unlinkSync', ((path: Parameters<typeof fs.unlinkSync>[0]) => {
+      if (failNextUnlink) {
+        failNextUnlink = false;
+        throw Object.assign(new Error('injected unlink failure'), { code: 'EACCES' });
+      }
+      return originalUnlinkSync(path);
+    }) as typeof fs.unlinkSync);
+    syncBuiltinESMExports();
+
+    assert.equal(handle.release(), false, 'a failed unlink must report an incomplete release');
+    assert.equal(existsSync(handle.path), true, 'a failed release must leave the lock for retry');
+
+    mock.restoreAll();
+    syncBuiltinESMExports();
+
+    assert.equal(handle.release(), true, 'a retry must report a completed release');
+    assert.equal(existsSync(handle.path), false, 'the retry must remove the lock');
+    assert.equal(handle.release(), true, 'release must remain idempotent');
+  } finally {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+    handle.release();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a dead same-host lock is not automatically reclaimed', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const dead = deadPid();
+  const previous = process.env.APEX_SCRAPER_FORCE_UNLOCK;
+  delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+
+  try {
+    const lockPath = writeLock(dbPath, { pid: dead, hostname: hostname(), token: 'stale-lock' });
+    const before = readFileSync(lockPath, 'utf8');
+    assert.throws(
+      () => acquireWriterLock(dbPath, quiet),
+      (error: unknown) => {
+        assert.ok(error instanceof WriterLockError, 'expected a WriterLockError');
+        assert.equal(error.holder?.pid, dead);
+        assert.match(error.message, /will not be taken automatically/);
+        assert.match(error.message, /APEX_SCRAPER_FORCE_UNLOCK=1/);
+        return true;
+      },
+    );
+    assert.equal(existsSync(lockPath), true, 'the refusal must leave the stale lock in place');
+    assert.equal(readFileSync(lockPath, 'utf8'), before, 'the refusal must not replace the stale lock');
+  } finally {
+    if (previous === undefined) delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+    else process.env.APEX_SCRAPER_FORCE_UNLOCK = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the override does not reclaim metadata without a usable hostname', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const lockPath = `${dbPath}.lock`;
+  const previous = process.env.APEX_SCRAPER_FORCE_UNLOCK;
+  process.env.APEX_SCRAPER_FORCE_UNLOCK = '1';
+  writeFileSync(
+    lockPath,
+    `${JSON.stringify({ pid: process.pid, token: 'incomplete-owner' })}\n`,
+    'utf8',
+  );
+  const before = readFileSync(lockPath, 'utf8');
+
+  try {
+    assert.throws(() => acquireWriterLock(dbPath, quiet), WriterLockError);
+    assert.equal(existsSync(lockPath), true, 'the unknown owner must keep the lock in place');
+    assert.equal(readFileSync(lockPath, 'utf8'), before, 'the unknown owner lock must be unchanged');
+  } finally {
+    if (previous === undefined) delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+    else process.env.APEX_SCRAPER_FORCE_UNLOCK = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a lock from another host needs the explicit override', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const previous = process.env.APEX_SCRAPER_FORCE_UNLOCK;
+  delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+  const otherHost = hostname() === 'some-other-host' ? 'some-other-host-2' : 'some-other-host';
+
+  try {
+    // Liveness cannot be checked across hosts, so the lock is respected.
+    const lockPath = writeLock(dbPath, { pid: 4242, hostname: otherHost });
+    const before = readFileSync(lockPath, 'utf8');
+    assert.throws(() => acquireWriterLock(dbPath, quiet), WriterLockError);
+    assert.equal(existsSync(lockPath), true, 'the refusal must leave the foreign-host lock in place');
+    assert.equal(readFileSync(lockPath, 'utf8'), before, 'the refusal must not replace the lock');
+
+    // The override is the only way past it.
+    process.env.APEX_SCRAPER_FORCE_UNLOCK = '1';
+    const handle = acquireWriterLock(dbPath, quiet);
+    handle.release();
+  } finally {
+    if (previous === undefined) delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+    else process.env.APEX_SCRAPER_FORCE_UNLOCK = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('lock ownership is bound to its token across reacquisition', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+
+  try {
+    const first = acquireWriterLock(dbPath, quiet);
+    const firstInfo = JSON.parse(readFileSync(first.path, 'utf-8')) as WriterLockInfo;
+    unlinkSync(first.path);
+
+    const second = acquireWriterLock(dbPath, quiet);
+    const secondInfo = JSON.parse(readFileSync(second.path, 'utf-8')) as WriterLockInfo;
+
+    first.release();
+    assert.equal(existsSync(second.path), true, 'an old handle must not release a successor lock');
+    assert.notEqual(secondInfo.token, firstInfo.token, 'a new acquisition needs a new ownership token');
+    second.release();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('release leaves unknown holder metadata untouched until a later retry', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const handle = acquireWriterLock(dbPath, quiet);
+  const info = JSON.parse(readFileSync(handle.path, 'utf8')) as WriterLockInfo;
+  const incomplete = `${JSON.stringify({ pid: info.pid, token: info.token })}\n`;
+  writeFileSync(handle.path, incomplete, 'utf8');
+  const before = readFileSync(handle.path, 'utf8');
+
+  try {
+    assert.equal(handle.release(), false, 'an unknown holder must report an incomplete release');
+    assert.equal(readFileSync(handle.path, 'utf8'), before, 'unknown holder metadata must remain untouched');
+    writeFileSync(handle.path, `${JSON.stringify(info)}\n`, 'utf8');
+    assert.equal(handle.release(), true, 'a valid retry must remove the lock');
+    assert.equal(existsSync(handle.path), false);
+  } finally {
+    handle.release();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the holder file contains the ownership token', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+
+  try {
+    const handle = acquireWriterLock(dbPath, quiet);
+    const info = JSON.parse(readFileSync(handle.path, 'utf-8')) as WriterLockInfo;
+    assert.match(info.token, /^[0-9a-f]{32}$/);
+    handle.release();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a directory at the lock path surfaces as a filesystem error', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  mkdirSync(`${dbPath}.lock`);
+
+  try {
+    assert.throws(
+      () => acquireWriterLock(dbPath, quiet),
+      (error: unknown) => {
+        assert.ok(!(error instanceof WriterLockError));
+        assert.match((error as Error).message, /not a regular file|directory/i);
+        return true;
+      },
+    );
+    assert.equal(existsSync(`${dbPath}.lock`), true, 'the rejected path must remain in place');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a symlink at the lock path is rejected with or without the override', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const target = join(dir, 'target');
+  writeFileSync(target, 'not a lock', 'utf-8');
+  symlinkSync(target, `${dbPath}.lock`);
+  const previous = process.env.APEX_SCRAPER_FORCE_UNLOCK;
+  delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+
+  const assertFilesystemError = (error: unknown): boolean => {
+    assert.ok(!(error instanceof WriterLockError));
+    assert.match((error as Error).message, /not a regular file|symbolic link|symlink/i);
+    return true;
+  };
+
+  try {
+    const before = readFileSync(target, 'utf8');
+    assert.throws(() => acquireWriterLock(dbPath, quiet), assertFilesystemError);
+    assert.equal(existsSync(`${dbPath}.lock`), true, 'the rejected symlink must remain in place');
+    assert.equal(readFileSync(target, 'utf8'), before, 'the rejected symlink target must be unchanged');
+
+    process.env.APEX_SCRAPER_FORCE_UNLOCK = '1';
+    assert.throws(() => acquireWriterLock(dbPath, quiet), assertFilesystemError);
+    assert.equal(existsSync(`${dbPath}.lock`), true, 'the override must not remove the symlink');
+    assert.equal(readFileSync(target, 'utf8'), before, 'the override must not change the symlink target');
+  } finally {
+    if (previous === undefined) delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+    else process.env.APEX_SCRAPER_FORCE_UNLOCK = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the override does not bypass a live same-host lock', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const previous = process.env.APEX_SCRAPER_FORCE_UNLOCK;
+  process.env.APEX_SCRAPER_FORCE_UNLOCK = '1';
+
+  try {
+    const handle = acquireWriterLock(dbPath, quiet);
+    const before = readFileSync(handle.path, 'utf8');
+    assert.throws(() => acquireWriterLock(dbPath, quiet), WriterLockError);
+    assert.equal(existsSync(handle.path), true, 'the override must not bypass a live lock');
+    assert.equal(readFileSync(handle.path, 'utf8'), before, 'the refused override must not replace the lock');
+    handle.release();
+  } finally {
+    if (previous === undefined) delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+    else process.env.APEX_SCRAPER_FORCE_UNLOCK = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the override reclaims a dead same-host lock', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const previous = process.env.APEX_SCRAPER_FORCE_UNLOCK;
+  process.env.APEX_SCRAPER_FORCE_UNLOCK = '1';
+  const dead = deadPid();
+
+  try {
+    writeLock(dbPath, { pid: dead, hostname: hostname(), token: 'stale-lock' });
+    const handle = acquireWriterLock(dbPath, quiet);
+    const info = JSON.parse(readFileSync(handle.path, 'utf-8')) as WriterLockInfo;
+    assert.notEqual(info.token, 'stale-lock');
+    handle.release();
+    assert.equal(existsSync(handle.path), false);
+  } finally {
+    if (previous === undefined) delete process.env.APEX_SCRAPER_FORCE_UNLOCK;
+    else process.env.APEX_SCRAPER_FORCE_UNLOCK = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a throwing info logger cannot strand a lock', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const log = new ThrowingInfoLogger('error');
+
+  try {
+    const handle = acquireWriterLock(dbPath, log);
+    assert.ok(existsSync(handle.path));
+    handle.release();
+    assert.equal(existsSync(handle.path), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a throwing warn logger cannot escape release', () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const log = new ThrowingWarnLogger('error');
+
+  try {
+    const handle = acquireWriterLock(dbPath, log);
+    rmSync(handle.path, { force: true });
+    mkdirSync(handle.path);
+    assert.doesNotThrow(() => handle.release());
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('cleanup error construction preserves both causes and names the lock path', () => {
+  const lockPath = '/tmp/apex-scraper/archive.db.lock';
+  const writeCause = new Error('write or close failed');
+  const cleanupCause = new Error('lock cleanup failed');
+
+  const error = makeWriterLockCleanupError(lockPath, writeCause, cleanupCause);
+
+  assert.ok(error instanceof WriterLockCleanupError);
+  assert.equal(error.lockPath, lockPath);
+  assert.ok(error.message.includes(lockPath));
+  assert.equal((error as Error & { cause?: unknown }).cause, writeCause);
+  assert.equal(error.cleanupCause, cleanupCause);
+});
+
+function makeConfig(dir: string): ScraperConfig {
+  return {
+    botToken: '',
+    userToken: 'test-token',
+    dbPath: join(dir, 'test.db'),
+    parallelism: 1,
+    chunkSize: 50,
+    pageDelayMs: 0,
+    maxRetries: 1,
+    backoffBaseMs: 1,
+    liveMaxBuffer: 1000,
+    logLevel: 'error',
+    requestsPerSecond: 1000,
+    timeoutMs: 2000,
+    maxBackoffMs: 5,
+    prettyJson: false,
+    balanceShards: false,
+  };
+}
+
+test('pre-init archive methods reject without creating an archive instance', () => {
+  const dir = makeTmpDir();
+  const jsonRoot = join(dir, 'test_json');
+  const extractor = new UserTokenExtractor(makeConfig(dir), quiet);
+  const source = new ControllableLiveSource();
+
+  try {
+    assert.throws(
+      () => extractor.loadChannelMessages('123456789012345678'),
+      /init.*before archive methods/i,
+    );
+    assert.throws(
+      () => extractor.createLiveCapture(source),
+      /init.*before archive methods/i,
+    );
+    assert.equal(existsSync(jsonRoot), false, 'pre-init archive access must not create the archive root');
+  } finally {
+    extractor.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a refused extractor does not create its archive directory before lock acquisition', async () => {
+  const dir = makeTmpDir();
+  const dbPath = join(dir, 'test.db');
+  const jsonRoot = dbPath.replace(/\.db$/, '_json');
+  const child = startLockHolder(dbPath);
+  let extractor: UserTokenExtractor | undefined;
+
+  try {
+    await waitForChildMessage(child, 'locked');
+    extractor = new UserTokenExtractor(makeConfig(dir), quiet);
+    await assert.rejects(() => extractor!.init(), WriterLockError);
+    assert.equal(existsSync(jsonRoot), false, 'a refused extractor must not create the archive directory');
+  } finally {
+    extractor?.close();
+    if (child.exitCode === null && child.signalCode === null) {
+      child.send('release');
+      await waitForChildExit(child).catch(() => undefined);
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a failed writer-lock release remains retryable through extractor close', async () => {
+  const dir = makeTmpDir();
+  const lockPath = join(dir, 'test.db.lock');
+  const extractor = new UserTokenExtractor(makeConfig(dir), quiet);
+  const originalUnlinkSync = fs.unlinkSync;
+  let failNextUnlink = true;
+
+  try {
+    await extractor.init();
+    mock.method(fs, 'unlinkSync', ((path: Parameters<typeof fs.unlinkSync>[0]) => {
+      if (failNextUnlink) {
+        failNextUnlink = false;
+        throw Object.assign(new Error('injected unlink failure'), { code: 'EACCES' });
+      }
+      return originalUnlinkSync(path);
+    }) as typeof fs.unlinkSync);
+    syncBuiltinESMExports();
+
+    try {
+      extractor.close();
+      assert.equal(existsSync(lockPath), true, 'a failed unlink must leave the lock for retry');
+    } finally {
+      mock.restoreAll();
+      syncBuiltinESMExports();
+    }
+
+    extractor.close();
+    assert.equal(existsSync(lockPath), false, 'the next close must retry the unlink');
+  } finally {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+    extractor.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('close stops live admission before releasing the writer lock', async () => {
+  const dir = makeTmpDir();
+  const channelId = '123456789012345678';
+  const source = new ControllableLiveSource();
+  const extractor = new UserTokenExtractor(makeConfig(dir), quiet);
+  let capture: LiveCapture | undefined;
+
+  try {
+    await extractor.init();
+    capture = extractor.createLiveCapture(source, {
+      flushIntervalMs: 60_000,
+      batchMessages: 1,
+    });
+    await capture.start([
+      { channelId, channelName: 'channel', guildId: 'guild-1', guildName: 'Guild' },
+    ]);
+
+    extractor.close();
+
+    assert.equal(source.closeCalls, 1, 'close must close the live source synchronously');
+    assert.equal(capture.isRunning(), false, 'close must stop live admission synchronously');
+    source.emit({
+      id: '123456789012345679',
+      channel_id: channelId,
+      content: 'late message',
+      timestamp: new Date().toISOString(),
+      author: { id: 'user-1', username: 'user', discriminator: '0' },
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(capture.getStats()[0]?.sessionMessages, 0, 'a late message was admitted after close');
+    assert.equal(existsSync(join(dir, 'test.db.lock')), false);
+  } finally {
+    if (capture?.isRunning()) await capture.stop();
+    extractor.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a second extractor cannot initialise the same data directory', async () => {
+  const dir = makeTmpDir();
+  const first = new UserTokenExtractor(makeConfig(dir), quiet);
+
+  try {
+    await first.init();
+    const lockPath = join(dir, 'test.db.lock');
+    assert.ok(existsSync(lockPath), 'init should take the writer lock');
+    const before = readFileSync(lockPath, 'utf8');
+
+    const second = new UserTokenExtractor(makeConfig(dir), quiet);
+    await assert.rejects(
+      () => second.init(),
+      (error: unknown) => error instanceof WriterLockError,
+      'a second process must be refused',
+    );
+    assert.equal(existsSync(lockPath), true, 'the refused extractor must leave the lock in place');
+    assert.equal(readFileSync(lockPath, 'utf8'), before, 'the refused extractor must not replace the lock');
+    // Closing an extractor that never initialised must not throw.
+    second.close();
+
+    first.close();
+    assert.equal(existsSync(join(dir, 'test.db.lock')), false, 'close should release the lock');
+
+    // The directory is usable again once the owner lets go.
+    const third = new UserTokenExtractor(makeConfig(dir), quiet);
+    await third.init();
+    third.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('close releases the writer lock when storage cleanup throws', async () => {
+  const dir = makeTmpDir();
+  const lockPath = join(dir, 'test.db.lock');
+  const storageError = new Error('storage close failed');
+  const extractor = new UserTokenExtractor(makeConfig(dir), quiet);
+  let storage: { close(): void } | undefined;
+
+  try {
+    await extractor.init();
+    storage = (extractor as any).storage;
+    (extractor as any).storage = {
+      close() {
+        throw storageError;
+      },
+    };
+
+    assert.throws(
+      () => extractor.close(),
+      (error: unknown) => error === storageError,
+      'close should surface the storage error',
+    );
+    assert.equal(existsSync(lockPath), false, 'cleanup failure must not strand the writer lock');
+  } finally {
+    storage?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

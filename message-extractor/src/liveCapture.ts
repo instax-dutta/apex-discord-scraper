@@ -13,7 +13,7 @@
 // size, or on shutdown. Flushes are serialized per channel, so the
 // double-buffer + pending-write model cannot reorder writes.
 
-import type { DiscordMessage, ExportRow } from './types.js';
+import type { ChannelProgress, DiscordMessage, ExportRow } from './types.js';
 import type { Storage } from './storage.js';
 import type { JsonStorage } from './jsonStorage.js';
 import { toExportRow } from './userTokenFetcher.js';
@@ -133,37 +133,85 @@ export class LiveCapture {
     return this.running;
   }
 
+  /** Stop timers and the source synchronously without waiting for in-flight flushes. */
+  stopAdmitting(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    this.running = false;
+    this.source.close();
+  }
+
   async start(channels: LiveChannel[]): Promise<void> {
     if (this.running) throw new Error('Live capture is already running');
     if (channels.length === 0) throw new Error('No channels provided for live capture');
 
+    // A failed start must leave no per-attempt state for the next attempt to inherit.
+    this.targets.clear();
+    this.buffers.clear();
+    this.sessionCounts.clear();
+    this.baseTotals.clear();
+    this.newestIds.clear();
+    this.floorIds.clear();
+    this.dedup.clear();
+    this.flushChains.clear();
+    this.sessionId = null;
+
     this.startedAt = new Date().toISOString();
 
-    for (const channel of channels) {
-      this.targets.set(channel.channelId, channel);
-      this.buffers.set(channel.channelId, []);
-      this.sessionCounts.set(channel.channelId, 0);
-      this.dedup.set(channel.channelId, new Set());
+    // What each channel looked like before this run claimed it. A source that
+    // cannot connect must not leave rows claiming a capture nobody is running.
+    const priorStatus = new Map<string, ChannelProgress['status']>();
+    const openedSessions: string[] = [];
 
-      const progress = await this.storage.getOrCreateProgress(
-        channel.channelId,
-        channel.guildId,
-        channel.channelName,
-      );
-      this.baseTotals.set(channel.channelId, progress.total_extracted || 0);
-      this.newestIds.set(channel.channelId, progress.newest_message_id ?? null);
-      this.floorIds.set(channel.channelId, progress.newest_message_id ?? '');
+    try {
+      for (const channel of channels) {
+        const progress = await this.storage.getOrCreateProgress(
+          channel.channelId,
+          channel.guildId,
+          channel.channelName,
+        );
+        priorStatus.set(channel.channelId, progress.status);
+
+        this.targets.set(channel.channelId, channel);
+        this.buffers.set(channel.channelId, []);
+        this.sessionCounts.set(channel.channelId, 0);
+        this.dedup.set(channel.channelId, new Set());
+
+        this.baseTotals.set(channel.channelId, progress.total_extracted || 0);
+        this.newestIds.set(channel.channelId, progress.newest_message_id ?? null);
+        this.floorIds.set(channel.channelId, progress.newest_message_id ?? '');
+      }
+
+      this.sessionId = `live-${Date.now()}`;
+
+      for (const channel of this.targets.values()) {
+        await this.storage.startLiveSession(this.sessionKey(channel.channelId), channel.channelId);
+        openedSessions.push(channel.channelId);
+        await this.storage.updateProgress(channel.channelId, { status: 'live', error_message: null });
+      }
+
+      this.source.onMessage((message) => this.handleMessage(message));
+      await this.source.start();
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      for (const channelId of openedSessions) {
+        try {
+          await this.storage.endLiveSession(this.sessionKey(channelId), 'error');
+          await this.storage.updateProgress(channelId, {
+            status: priorStatus.get(channelId) ?? 'error',
+            error_message: reason,
+          });
+        } catch (cleanupError: any) {
+          // Cleanup must never replace the connect error with its own.
+          this.log.error(
+            `Failed to roll back live capture for ${channelId}: ${cleanupError?.message ?? cleanupError}`,
+          );
+        }
+      }
+      throw error;
     }
-
-    this.sessionId = `live-${Date.now()}`;
-
-    for (const channel of this.targets.values()) {
-      await this.storage.startLiveSession(this.sessionKey(channel.channelId), channel.channelId);
-      await this.storage.updateProgress(channel.channelId, { status: 'live', error_message: null });
-    }
-
-    this.source.onMessage((message) => this.handleMessage(message));
-    await this.source.start();
 
     this.running = true;
     this.timer = setInterval(() => {
@@ -177,13 +225,8 @@ export class LiveCapture {
   }
 
   async stop(): Promise<LiveCaptureSummary> {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-
     // Stop the source first so no new messages arrive during the final flush.
-    this.source.close();
+    this.stopAdmitting();
     await this.flushAll();
     await Promise.allSettled([...this.flushChains.values()]);
 
@@ -261,6 +304,7 @@ export class LiveCapture {
   }
 
   private handleMessage(message: DiscordMessage): void {
+    if (!this.running) return;
     const channelId = message.channel_id;
     if (!channelId) return;
 

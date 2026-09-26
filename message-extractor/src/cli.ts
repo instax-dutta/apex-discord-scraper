@@ -7,7 +7,9 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'fs
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import type { ScraperConfig } from './types.js';
+import { Storage } from './storage.js';
 import { UserTokenExtractor, type ChannelInfo } from './userTokenExtractor.js';
+import { acquireWriterLock } from './writerLock.js';
 import { Logger, formatDuration, formatBytes, resolveJsonlPath } from './utils.js';
 import { parseResumeState, describeResumeState } from './resumable.js';
 import { describeBalance, formatCount } from './segments.js';
@@ -39,7 +41,11 @@ function loadFileEnv(): Record<string, string> {
 
 function createEnvResolver(): (key: string) => string | undefined {
   const fileEnv = loadFileEnv();
-  return (key: string) => process.env[key] ?? fileEnv[key];
+  for (const [key, value] of Object.entries(fileEnv)) {
+    // Modules that read process.env directly must observe the same file values.
+    if (process.env[key] === undefined) process.env[key] = value;
+  }
+  return (key: string) => process.env[key];
 }
 
 function parseNumber(value: string | undefined, fallback: number): number {
@@ -100,48 +106,82 @@ function getConfig(): ScraperConfig {
   };
 }
 
+function warnIfWriterLockReleaseFailed(lockPath: string, log: Logger): void {
+  log.warn(
+    `Writer lock at ${lockPath} could not be removed and may remain. ` +
+    `Verify that no writer is active, then remove it manually. ` +
+    `The override is usable only when the lock has usable holder metadata and the recorded owner is inactive; ` +
+    `if so, set APEX_SCRAPER_FORCE_UNLOCK=1 and retry. It accepts the risk of racing another writer.`,
+  );
+}
+
+function remainingWriterLockPath(extractor: UserTokenExtractor): string | null {
+  const handle = (extractor as unknown as { writerLock?: { path: string } | null }).writerLock;
+  return handle?.path ?? null;
+}
+
+async function withInitializedExtractor<T>(
+  config: ScraperConfig,
+  log: Logger,
+  work: (extractor: UserTokenExtractor) => Promise<T>,
+): Promise<T> {
+  const extractor = new UserTokenExtractor(config, log);
+  try {
+    await extractor.init();
+  } catch (error) {
+    const lockPath = remainingWriterLockPath(extractor);
+    if (lockPath) warnIfWriterLockReleaseFailed(lockPath, log);
+    throw error;
+  }
+  try {
+    return await work(extractor);
+  } finally {
+    try {
+      extractor.close();
+    } finally {
+      const lockPath = remainingWriterLockPath(extractor);
+      if (lockPath) warnIfWriterLockReleaseFailed(lockPath, log);
+    }
+  }
+}
+
 async function cmdValidate(config: ScraperConfig) {
   const log = new Logger('info');
-  const extractor = new UserTokenExtractor(config, log);
+  await withInitializedExtractor(config, log, async (extractor) => {
+    console.log('Validating Discord token...\n');
 
-  console.log('Validating Discord token...\n');
+    const result = await extractor.validateToken();
 
-  const result = await extractor.validateToken();
-
-  if (result.valid) {
-    const user = result.user as any;
-    console.log('Token is valid!');
-    console.log(`User: ${user.username} (${user.id})`);
-    console.log(`Email: ${user.email || 'N/A'}`);
-  } else {
-    console.error(`Token validation failed: ${result.error}`);
-    process.exit(1);
-  }
-
-  extractor.close();
+    if (result.valid) {
+      const user = result.user as any;
+      console.log('Token is valid!');
+      console.log(`User: ${user.username} (${user.id})`);
+      console.log(`Email: ${user.email || 'N/A'}`);
+    } else {
+      throw new Error(`Token validation failed: ${result.error}`);
+    }
+  });
 }
 
 async function cmdListChannels(config: ScraperConfig) {
   const log = new Logger('info');
-  const extractor = new UserTokenExtractor(config, log);
+  await withInitializedExtractor(config, log, async (extractor) => {
+    console.log('Fetching accessible channels...\n');
 
-  console.log('Fetching accessible channels...\n');
+    const channelsByGuild = await extractor.listChannels();
 
-  const channelsByGuild = await extractor.listChannels();
-
-  if (channelsByGuild.size === 0) {
-    console.log('No channels found. Make sure you are a member of some servers.');
-  } else {
-    for (const [guildId, channels] of channelsByGuild) {
-      const guildName = channels[0]?.guildName || guildId;
-      console.log(`\n=== ${guildName} (${guildId}) ===`);
-      for (const ch of channels) {
-        console.log(`  #${ch.channelName} (${ch.channelId})`);
+    if (channelsByGuild.size === 0) {
+      console.log('No channels found. Make sure you are a member of some servers.');
+    } else {
+      for (const [guildId, channels] of channelsByGuild) {
+        const guildName = channels[0]?.guildName || guildId;
+        console.log(`\n=== ${guildName} (${guildId}) ===`);
+        for (const ch of channels) {
+          console.log(`  #${ch.channelName} (${ch.channelId})`);
+        }
       }
     }
-  }
-
-  extractor.close();
+  });
 }
 
 interface ExtractArgs {
@@ -234,101 +274,98 @@ async function cmdExtract(config: ScraperConfig, args: string[]) {
   if (parsed.densityProbes !== null) config.densityProbes = parsed.densityProbes;
 
   const log = new Logger('info');
-  const extractor = new UserTokenExtractor(config, log);
-  await extractor.init();
-
-  // Channel names are a nicety. If listing fails (rate limit, permission), we
-  // still extract - so never let it abort the run.
-  const channelInfoMap = new Map<string, ChannelInfo>();
-  try {
-    const allChannels = await extractor.listChannels();
-    for (const channels of allChannels.values()) {
-      for (const ch of channels) channelInfoMap.set(ch.channelId, ch);
+  await withInitializedExtractor(config, log, async (extractor) => {
+    // Channel names are a nicety. If listing fails (rate limit, permission), we
+    // still extract - so never let it abort the run.
+    const channelInfoMap = new Map<string, ChannelInfo>();
+    try {
+      const allChannels = await extractor.listChannels();
+      for (const channels of allChannels.values()) {
+        for (const ch of channels) channelInfoMap.set(ch.channelId, ch);
+      }
+    } catch (e: any) {
+      log.warn(`Could not list channels (${e?.message ?? e}); continuing with provided IDs`);
     }
-  } catch (e: any) {
-    log.warn(`Could not list channels (${e?.message ?? e}); continuing with provided IDs`);
-  }
 
-  const channelsToExtract: ChannelInfo[] = parsed.channelIds.map((id) => {
-    const info = channelInfoMap.get(id);
-    return info ?? { channelId: id, channelName: id, guildId: '', guildName: 'Unknown' };
-  });
+    const channelsToExtract: ChannelInfo[] = parsed.channelIds.map((id) => {
+      const info = channelInfoMap.get(id);
+      return info ?? { channelId: id, channelName: id, guildId: '', guildName: 'Unknown' };
+    });
 
-  console.log(
-    `\nExtracting ${channelsToExtract.length} channel(s) with concurrency ${parsed.concurrency}...\n`,
-  );
+    console.log(
+      `\nExtracting ${channelsToExtract.length} channel(s) with concurrency ${parsed.concurrency}...\n`,
+    );
 
-  const singleChannel = channelsToExtract.length === 1;
-  const jsonlTemplate = parsed.exportJsonl;
+    const singleChannel = channelsToExtract.length === 1;
+    const jsonlTemplate = parsed.exportJsonl;
 
-  let totalMessages = 0;
-  let totalTime = 0;
-  let totalJsonl = 0;
+    let totalMessages = 0;
+    let totalTime = 0;
+    let totalJsonl = 0;
 
-  const results = await extractor.extractAll(channelsToExtract, {
-    concurrency: parsed.concurrency,
-    incremental: parsed.incremental,
-    since: parsed.since,
-    full: parsed.full,
-    exportJsonl: jsonlTemplate
-      ? (channel) => resolveJsonlPath(jsonlTemplate, channel.channelId, singleChannel)
-      : null,
-    onChannelProgress: (stats) => {
-      process.stdout.write(
-        `\r  ${stats.channelId}: ${stats.total} messages (${stats.rate} msg/s)   `,
-      );
-    },
-    onChannelComplete: (result) => {
-      process.stdout.write('\n');
-      if (result.success) {
-        const extras = [
-          result.duplicatesSkipped > 0 ? `${result.duplicatesSkipped} dupes skipped` : null,
-          result.usedFallback ? 'used fallback' : null,
-        ].filter(Boolean).join(', ');
-        console.log(
-          `  [OK] #${result.channelName} (${result.guildName}): ` +
-          `${result.messagesExtracted} messages in ${formatDuration(result.duration)}` +
-          (extras ? ` (${extras})` : ''),
+    const results = await extractor.extractAll(channelsToExtract, {
+      concurrency: parsed.concurrency,
+      incremental: parsed.incremental,
+      since: parsed.since,
+      full: parsed.full,
+      exportJsonl: jsonlTemplate
+        ? (channel) => resolveJsonlPath(jsonlTemplate, channel.channelId, singleChannel)
+        : null,
+      onChannelProgress: (stats) => {
+        process.stdout.write(
+          `\r  ${stats.channelId}: ${stats.total} messages (${stats.rate} msg/s)   `,
         );
-      } else {
-        console.log(`  [FAIL] #${result.channelName}: ${result.error}`);
-        if (result.failedShards) {
-          console.log(`         ${result.failedShards} shard(s) incomplete - rerun to resume`);
+      },
+      onChannelComplete: (result) => {
+        process.stdout.write('\n');
+        if (result.success) {
+          const extras = [
+            result.duplicatesSkipped > 0 ? `${result.duplicatesSkipped} dupes skipped` : null,
+            result.usedFallback ? 'used fallback' : null,
+          ].filter(Boolean).join(', ');
+          console.log(
+            `  [OK] #${result.channelName} (${result.guildName}): ` +
+            `${result.messagesExtracted} messages in ${formatDuration(result.duration)}` +
+            (extras ? ` (${extras})` : ''),
+          );
+        } else {
+          console.log(`  [FAIL] #${result.channelName}: ${result.error}`);
+          if (result.failedShards) {
+            console.log(`         ${result.failedShards} shard(s) incomplete - rerun to resume`);
+          }
         }
-      }
-      if (result.jsonlError) {
-        console.log(`         JSONL export failed: ${result.jsonlError}`);
-      }
-      totalMessages += result.messagesExtracted;
-      totalTime += result.duration;
-      totalJsonl += result.jsonlRows ?? 0;
-    },
+        if (result.jsonlError) {
+          console.log(`         JSONL export failed: ${result.jsonlError}`);
+        }
+        totalMessages += result.messagesExtracted;
+        totalTime += result.duration;
+        totalJsonl += result.jsonlRows ?? 0;
+      },
+    });
+
+    const failed = results.filter((r) => !r.success);
+
+    console.log('\n=== Summary ===');
+    if (parsed.incremental) {
+      console.log(`Mode: incremental catch-up${parsed.since ? ` (since ${parsed.since})` : ''}`);
+    } else if (!parsed.full) {
+      console.log('Mode: auto (channels already done are caught up incrementally)');
+    }
+    console.log(`Total messages: ${totalMessages}`);
+    console.log(`Total time: ${formatDuration(totalTime)}`);
+    console.log(`Database: ${config.dbPath}`);
+    if (jsonlTemplate) {
+      const target = singleChannel
+        ? resolveJsonlPath(jsonlTemplate, channelsToExtract[0].channelId, true)
+        : `${channelsToExtract.length} files from ${jsonlTemplate}`;
+      console.log(`JSONL export: ${target} (${totalJsonl} lines)`);
+    }
+
+    if (failed.length > 0) {
+      console.log(`\n${failed.length} channel(s) incomplete - rerun the same command to resume.`);
+      process.exitCode = 1;
+    }
   });
-
-  const failed = results.filter((r) => !r.success);
-
-  console.log('\n=== Summary ===');
-  if (parsed.incremental) {
-    console.log(`Mode: incremental catch-up${parsed.since ? ` (since ${parsed.since})` : ''}`);
-  } else if (!parsed.full) {
-    console.log('Mode: auto (channels already done are caught up incrementally)');
-  }
-  console.log(`Total messages: ${totalMessages}`);
-  console.log(`Total time: ${formatDuration(totalTime)}`);
-  console.log(`Database: ${config.dbPath}`);
-  if (jsonlTemplate) {
-    const target = singleChannel
-      ? resolveJsonlPath(jsonlTemplate, channelsToExtract[0].channelId, true)
-      : `${channelsToExtract.length} files from ${jsonlTemplate}`;
-    console.log(`JSONL export: ${target} (${totalJsonl} lines)`);
-  }
-
-  if (failed.length > 0) {
-    console.log(`\n${failed.length} channel(s) incomplete - rerun the same command to resume.`);
-    process.exitCode = 1;
-  }
-
-  extractor.close();
 }
 
 async function cmdLive(config: ScraperConfig, args: string[]) {
@@ -348,71 +385,77 @@ async function cmdLive(config: ScraperConfig, args: string[]) {
   }
 
   const log = new Logger('info');
-  const extractor = new UserTokenExtractor(config, log);
-  await extractor.init();
-
-  // Resolve names where we can; a naming failure must not stop the capture.
-  const channelInfoMap = new Map<string, ChannelInfo>();
-  try {
-    const allChannels = await extractor.listChannels();
-    for (const channels of allChannels.values()) {
-      for (const ch of channels) channelInfoMap.set(ch.channelId, ch);
-    }
-  } catch (e: any) {
-    log.warn(`Could not list channels (${e?.message ?? e}); continuing with provided IDs`);
-  }
-
-  const channels = channelIds.map(
-    (id) =>
-      channelInfoMap.get(id) ?? {
-        channelId: id,
-        channelName: id,
-        guildId: '',
-        guildName: 'Unknown',
-      },
-  );
-
-  const capture = extractor.createLiveCapture(extractor.createLiveSource(), {
-    flushIntervalMs,
-    batchMessages: config.liveBatchMessages,
-    excludeBots,
-    onMessage: (channelId, count) => {
-      process.stdout.write(`\r  ${channelId}: ${count} live message(s)   `);
-    },
-  });
-
-  let shuttingDown = false;
-  const shutdown = async (signal: string) => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    console.log(`\n\nReceived ${signal}; flushing and shutting down...`);
+  await withInitializedExtractor(config, log, async (extractor) => {
+    // Resolve names where we can; a naming failure must not stop the capture.
+    const channelInfoMap = new Map<string, ChannelInfo>();
     try {
-      const summary = await capture.stop();
-      console.log('\n=== Live Capture Summary ===');
-      console.log(`Messages captured: ${summary.messages}`);
-      for (const c of summary.channels) {
-        console.log(
-          `  #${c.channelName}: +${c.sessionMessages} ` +
-          `(archive: ${c.totalMessages} in ${c.jsonParts} parts)`,
-        );
+      const allChannels = await extractor.listChannels();
+      for (const channels of allChannels.values()) {
+        for (const ch of channels) channelInfoMap.set(ch.channelId, ch);
       }
     } catch (e: any) {
-      console.error(`Shutdown error: ${e?.message ?? e}`);
-    } finally {
-      extractor.close();
-      process.exit(0);
+      log.warn(`Could not list channels (${e?.message ?? e}); continuing with provided IDs`);
     }
-  };
 
-  process.on('SIGINT', () => void shutdown('SIGINT'));
-  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+    const channels = channelIds.map(
+      (id) =>
+        channelInfoMap.get(id) ?? {
+          channelId: id,
+          channelName: id,
+          guildId: '',
+          guildName: 'Unknown',
+        },
+    );
 
-  console.log(`\nStarting live capture for ${channels.length} channel(s)...\n`);
-  await capture.start(channels);
-  console.log('Listening for new messages. Press Ctrl+C to stop.\n');
+    const capture = extractor.createLiveCapture(extractor.createLiveSource(), {
+      flushIntervalMs,
+      batchMessages: config.liveBatchMessages,
+      excludeBots,
+      onMessage: (channelId, count) => {
+        process.stdout.write(`\r  ${channelId}: ${count} live message(s)   `);
+      },
+    });
 
-  // Keep the process alive until a signal arrives.
-  await new Promise<void>(() => {});
+    let shuttingDown = false;
+    let finishShutdown!: () => void;
+    const shutdownComplete = new Promise<void>((resolve) => {
+      finishShutdown = resolve;
+    });
+    const shutdown = async (signal: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      console.log(`\n\nReceived ${signal}; flushing and shutting down...`);
+      try {
+        const summary = await capture.stop();
+        console.log('\n=== Live Capture Summary ===');
+        console.log(`Messages captured: ${summary.messages}`);
+        for (const c of summary.channels) {
+          console.log(
+            `  #${c.channelName}: +${c.sessionMessages} ` +
+            `(archive: ${c.totalMessages} in ${c.jsonParts} parts)`,
+          );
+        }
+      } catch (e: any) {
+        console.error(`Shutdown error: ${e?.message ?? e}`);
+      } finally {
+        finishShutdown();
+      }
+    };
+    const onSigint = () => void shutdown('SIGINT');
+    const onSigterm = () => void shutdown('SIGTERM');
+    process.on('SIGINT', onSigint);
+    process.on('SIGTERM', onSigterm);
+
+    try {
+      console.log(`\nStarting live capture for ${channels.length} channel(s)...\n`);
+      await capture.start(channels);
+      console.log('Listening for new messages. Press Ctrl+C to stop.\n');
+      await shutdownComplete;
+    } finally {
+      process.removeListener('SIGINT', onSigint);
+      process.removeListener('SIGTERM', onSigterm);
+    }
+  });
 }
 
 async function cmdWatch(config: ScraperConfig, args: string[]) {
@@ -433,117 +476,118 @@ async function cmdWatch(config: ScraperConfig, args: string[]) {
   }
 
   const log = new Logger('info');
-  const extractor = new UserTokenExtractor(config, log);
-  await extractor.init();
+  await withInitializedExtractor(config, log, async (extractor) => {
+    const minutesLabel = (intervalMs / 60_000).toFixed(intervalMs % 60_000 === 0 ? 0 : 1);
 
-  const minutesLabel = (intervalMs / 60_000).toFixed(intervalMs % 60_000 === 0 ? 0 : 1);
+    const scheduler = new CatchUpScheduler(extractor, {
+      intervalMs,
+      concurrency,
+      includeMissingBaseline,
+      onCycleStart: (plan) => {
+        for (const item of plan.due) console.log(`  due: #${item.channelName} (${item.channelId})`);
+        for (const skip of plan.skipped) console.log(`  skip ${skip.channelId}: ${skip.reason}`);
+      },
+      onCycleComplete: (result) => {
+        const time = result.finishedAt;
+        console.log(
+          `  cycle done at ${time}: +${result.messages} message(s), ` +
+          `${result.failures} failure(s)`,
+        );
+        if (!once) console.log(`  next cycle in ~${minutesLabel} min\n`);
+      },
+    });
 
-  const scheduler = new CatchUpScheduler(extractor, {
-    intervalMs,
-    concurrency,
-    includeMissingBaseline,
-    onCycleStart: (plan) => {
-      for (const item of plan.due) console.log(`  due: #${item.channelName} (${item.channelId})`);
-      for (const skip of plan.skipped) console.log(`  skip ${skip.channelId}: ${skip.reason}`);
-    },
-    onCycleComplete: (result) => {
-      const time = result.finishedAt;
-      console.log(
-        `  cycle done at ${time}: +${result.messages} message(s), ` +
-        `${result.failures} failure(s)`,
-      );
-      if (!once) console.log(`  next cycle in ~${minutesLabel} min\n`);
-    },
+    let shuttingDown = false;
+    const shutdown = (signal: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      console.log(`\nReceived ${signal}; stopping catch-up scheduler...`);
+      scheduler.stop();
+    };
+    const onSigint = () => shutdown('SIGINT');
+    const onSigterm = () => shutdown('SIGTERM');
+    process.on('SIGINT', onSigint);
+    process.on('SIGTERM', onSigterm);
+
+    try {
+      console.log(`\nCatch-up scheduler: every ~${minutesLabel} min, concurrency ${concurrency}.`);
+      if (!includeMissingBaseline) {
+        console.log('Channels that were never extracted are skipped (use --include-new to include them).');
+      }
+      console.log('Press Ctrl+C to stop.\n');
+
+      if (once) {
+        const result = await scheduler.runCycle();
+        if (result.failures > 0) process.exitCode = 1;
+        return;
+      }
+
+      await scheduler.start();
+    } finally {
+      process.removeListener('SIGINT', onSigint);
+      process.removeListener('SIGTERM', onSigterm);
+    }
   });
-
-  let shuttingDown = false;
-  const shutdown = (signal: string) => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    console.log(`\nReceived ${signal}; stopping catch-up scheduler...`);
-    scheduler.stop();
-  };
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-
-  console.log(`\nCatch-up scheduler: every ~${minutesLabel} min, concurrency ${concurrency}.`);
-  if (!includeMissingBaseline) {
-    console.log('Channels that were never extracted are skipped (use --include-new to include them).');
-  }
-  console.log('Press Ctrl+C to stop.\n');
-
-  if (once) {
-    const result = await scheduler.runCycle();
-    extractor.close();
-    if (result.failures > 0) process.exitCode = 1;
-    return;
-  }
-
-  await scheduler.start();
-  extractor.close();
 }
 
 async function cmdStatus(config: ScraperConfig) {
   const log = new Logger('warn');
-  const extractor = new UserTokenExtractor(config, log);
-  await extractor.init();
+  await withInitializedExtractor(config, log, async (extractor) => {
+    const status = await extractor.getStatus();
 
-  const status = await extractor.getStatus();
+    if (status.length === 0) {
+      console.log('No extraction history found.');
+      console.log('Run "apex-scraper extract <channel_id>" to start extracting.');
+    } else {
+      console.log('\n=== Extraction Status ===\n');
+      for (const s of status) {
+        const stats = extractor.getChannelStats(s.channelId);
+        const icons: Record<string, string> = {
+          done: '[OK]',
+          error: '[ERR]',
+          extracting: '[...]',
+          live: '[LIVE]',
+          pending: '[  ]',
+        };
+        const icon = icons[s.status] ?? '[  ]';
+        const parts = stats ? `${stats.jsonParts} parts` : '';
+        const size = stats ? `(${formatBytes(stats.sizeBytes)})` : '';
+        console.log(`  ${icon} ${s.channelId}: ${s.status} (${s.total} messages) ${parts} ${size}`);
+        printDedupReport(extractor, s.channelId);
 
-  if (status.length === 0) {
-    console.log('No extraction history found.');
-    console.log('Run "apex-scraper extract <channel_id>" to start extracting.');
-  } else {
-    console.log('\n=== Extraction Status ===\n');
-    for (const s of status) {
-      const stats = extractor.getChannelStats(s.channelId);
-      const icons: Record<string, string> = {
-        done: '[OK]',
-        error: '[ERR]',
-        extracting: '[...]',
-        live: '[LIVE]',
-        pending: '[  ]',
-      };
-      const icon = icons[s.status] ?? '[  ]';
-      const parts = stats ? `${stats.jsonParts} parts` : '';
-      const size = stats ? `(${formatBytes(stats.sizeBytes)})` : '';
-      console.log(`  ${icon} ${s.channelId}: ${s.status} (${s.total} messages) ${parts} ${size}`);
-      printDedupReport(extractor, s.channelId);
+        const detail = await extractor.getProgressDetail(s.channelId);
+        const resume = parseResumeState(detail?.resume_state ?? null);
+        if (resume) {
+          console.log(`        resume: ${describeResumeState(resume)}`);
 
-      const detail = await extractor.getProgressDetail(s.channelId);
-      const resume = parseResumeState(detail?.resume_state ?? null);
-      if (resume) {
-        console.log(`        resume: ${describeResumeState(resume)}`);
+          const balance = describeBalance(resume.balance);
+          if (balance) {
+            console.log(`        balance: ${balance}`);
+          }
 
-        const balance = describeBalance(resume.balance);
-        if (balance) {
-          console.log(`        balance: ${balance}`);
+          // Show the actual per-shard estimate when there are few enough to read.
+          const loads = resume.balance?.loads;
+          if (loads && loads.length > 1 && loads.length <= 12) {
+            console.log(`        est. per shard: ${loads.map((n) => formatCount(n)).join(' | ')}`);
+          }
         }
-
-        // Show the actual per-shard estimate when there are few enough to read.
-        const loads = resume.balance?.loads;
-        if (loads && loads.length > 1 && loads.length <= 12) {
-          console.log(`        est. per shard: ${loads.map((n) => formatCount(n)).join(' | ')}`);
+        if (detail?.error_message) {
+          console.log(`        last error: ${detail.error_message}`);
         }
-      }
-      if (detail?.error_message) {
-        console.log(`        last error: ${detail.error_message}`);
       }
     }
-  }
 
-  const rate = extractor.rateLimiter.getState();
-  console.log('\n=== Rate Limiter ===');
-  console.log(
-    `  circuit: ${rate.circuitState}, in-flight: ${rate.inFlight}, ` +
-    `pacing: ${rate.currentIntervalMs}ms, buckets: ${rate.buckets}`,
-  );
+    const rate = extractor.rateLimiter.getState();
+    console.log('\n=== Rate Limiter ===');
+    console.log(
+      `  circuit: ${rate.circuitState}, in-flight: ${rate.inFlight}, ` +
+      `pacing: ${rate.currentIntervalMs}ms, buckets: ${rate.buckets}`,
+    );
 
-  console.log('\n=== Storage Info ===');
-  console.log(`SQLite (metadata): ${config.dbPath}`);
-  console.log(`JSON (messages): ${config.dbPath.replace(/\.db$/, '_json')}/`);
-
-  extractor.close();
+    console.log('\n=== Storage Info ===');
+    console.log(`SQLite (metadata): ${config.dbPath}`);
+    console.log(`JSON (messages): ${config.dbPath.replace(/\.db$/, '_json')}/`);
+  });
 }
 
 /**
@@ -584,24 +628,21 @@ async function cmdDump(config: ScraperConfig, args: string[]) {
   const outputFile = args[1] || `./data/${channelId}-export.json`;
 
   const log = new Logger('warn');
-  const extractor = new UserTokenExtractor(config, log);
-  await extractor.init();
+  await withInitializedExtractor(config, log, async (extractor) => {
+    const stats = extractor.getChannelStats(channelId);
 
-  const stats = extractor.getChannelStats(channelId);
-
-  if (!stats) {
-    console.log(`No data found for channel ${channelId}`);
-    console.log('Make sure you have extracted this channel first:');
-    console.log(`  apex-scraper extract ${channelId}`);
-  } else {
-    const count = extractor.exportChannelToJson(channelId, outputFile);
-    console.log(`Exported ${count} messages to ${outputFile}`);
-    if (existsSync(outputFile)) {
-      console.log(`File size: ${formatBytes(statSync(outputFile).size)}`);
+    if (!stats) {
+      console.log(`No data found for channel ${channelId}`);
+      console.log('Make sure you have extracted this channel first:');
+      console.log(`  apex-scraper extract ${channelId}`);
+    } else {
+      const count = extractor.exportChannelToJson(channelId, outputFile);
+      console.log(`Exported ${count} messages to ${outputFile}`);
+      if (existsSync(outputFile)) {
+        console.log(`File size: ${formatBytes(statSync(outputFile).size)}`);
+      }
     }
-  }
-
-  extractor.close();
+  });
 }
 
 async function cmdReset(config: ScraperConfig, args: string[]) {
@@ -611,14 +652,11 @@ async function cmdReset(config: ScraperConfig, args: string[]) {
   }
 
   const log = new Logger('warn');
-  const extractor = new UserTokenExtractor(config, log);
-  await extractor.init();
-
-  for (const channelId of args) {
-    await extractor.resetChannel(channelId);
-  }
-
-  extractor.close();
+  await withInitializedExtractor(config, log, async (extractor) => {
+    for (const channelId of args) {
+      await extractor.resetChannel(channelId);
+    }
+  });
 }
 
 async function cmdQuery(config: ScraperConfig, args: string[]) {
@@ -629,26 +667,30 @@ async function cmdQuery(config: ScraperConfig, args: string[]) {
   }
 
   const sql = args.join(' ');
-  const log = new Logger('error');
-  const { Storage } = await import('./storage.js');
-  const storage = new Storage(config.dbPath, log);
-  await storage.init();
-
+  const log = new Logger('warn');
+  const writerLock = acquireWriterLock(config.dbPath, log);
   try {
-    const stmt = (storage as any).db.prepare(sql);
-    const results: any[] = [];
-    while (stmt.step()) {
-      results.push(stmt.getAsObject());
+    const storage = new Storage(config.dbPath, log);
+    try {
+      await storage.init();
+      const stmt = (storage as any).db.prepare(sql);
+      try {
+        const results: any[] = [];
+        while (stmt.step()) {
+          results.push(stmt.getAsObject());
+        }
+        console.log(JSON.stringify(results, null, 2));
+      } finally {
+        stmt.free();
+      }
+    } finally {
+      storage.close();
     }
-    stmt.free();
-    console.log(JSON.stringify(results, null, 2));
-  } catch (e: any) {
-    console.error(`Query error: ${e.message}`);
-    storage.close();
-    process.exit(1);
+  } finally {
+    if (!writerLock.release()) {
+      warnIfWriterLockReleaseFailed(writerLock.path, log);
+    }
   }
-
-  storage.close();
 }
 
 function printUsage() {

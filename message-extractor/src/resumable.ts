@@ -17,7 +17,7 @@ import type {
 } from './types.js';
 import { calculateTimeSegments } from './utils.js';
 
-export const RESUME_STATE_VERSION = 2;
+export const RESUME_STATE_VERSION = 3;
 
 /** Keep only the fields we understand, so a corrupt blob cannot leak through. */
 function sanitizeBalance(raw: any): SegmentBalance | null {
@@ -53,6 +53,7 @@ export function createResumeState(
       index,
       after: segment.after,
       before: segment.before,
+      afterInclusive: segment.afterInclusive,
       cursor: null,
       done: false,
     })),
@@ -97,16 +98,19 @@ export function parseResumeState(json: string | null | undefined): ChannelResume
   try {
     const parsed = JSON.parse(json) as Partial<ChannelResumeState>;
     if (
-      parsed?.version !== RESUME_STATE_VERSION ||
+      (parsed?.version !== 2 && parsed?.version !== RESUME_STATE_VERSION) ||
       !Array.isArray(parsed.segments) ||
       typeof parsed.parallelism !== 'number'
     ) {
       return null;
     }
+    const migrateV2 = parsed.version === 2;
     const segments: SegmentResumeState[] = parsed.segments.map((seg, index) => ({
       index: typeof seg?.index === 'number' ? seg.index : index,
       after: typeof seg?.after === 'string' ? seg.after : '',
       before: typeof seg?.before === 'string' ? seg.before : '',
+      // Unknown legacy windows are inclusive because a duplicate is recoverable, but a skip is not.
+      afterInclusive: migrateV2 ? true : seg?.afterInclusive === true,
       cursor: typeof seg?.cursor === 'string' ? seg.cursor : null,
       done: seg?.done === true,
     }));
@@ -141,6 +145,7 @@ export function cloneResumeState(state: ChannelResumeState): ChannelResumeState 
       index: s.index,
       after: s.after,
       before: s.before,
+      afterInclusive: s.afterInclusive,
       cursor: s.cursor,
       done: s.done,
     })),
@@ -187,7 +192,7 @@ export function resolveSegments(
       segments: saved!.segments
         .slice()
         .sort((a, b) => a.index - b.index)
-        .map((s) => ({ after: s.after, before: s.before })),
+        .map((s) => ({ after: s.after, before: s.before, afterInclusive: s.afterInclusive })),
       state: saved!,
     };
   }
@@ -197,6 +202,62 @@ export function resolveSegments(
       ? freshSegments
       : calculateTimeSegments(channelId, parallelism);
   return { segments, state: createResumeState(segments, parallelism, freshBalance ?? null) };
+}
+
+export type IncrementalWindowReason = 'ok' | 'no-baseline' | 'pending-shards' | 'unknown-state';
+
+export interface IncrementalWindowDecision {
+  /** True when this run may use a single catch-up window instead of the saved layout. */
+  useIncrementalWindow: boolean;
+  /** True when the saved state is itself that catch-up window and should be resumed as-is. */
+  reuseSavedWindow: boolean;
+  reason: IncrementalWindowReason;
+}
+
+/**
+ * Decide whether a catch-up window may replace the saved shard layout.
+ *
+ * A one-segment window only covers messages newer than the baseline. Applying it
+ * to a layout that still has pending shards silently discards those shards'
+ * windows, so the channel would finish as `done` with a permanent hole in its
+ * history. Two states are safe: every shard is done (the normal catch-up after a
+ * completed run), or the saved state is a single segment whose lower bound is the
+ * baseline - that is a previous catch-up resuming after a failure, not a lost
+ * multi-shard layout. A missing state is not evidence that the prior layout
+ * finished: without independent archive evidence, its windows are unknown and
+ * a full extraction is safer than sealing a catch-up over a possible hole.
+ */
+export function decideIncrementalWindow(
+  baseline: string | null,
+  savedState: ChannelResumeState | null,
+  archiveComplete: boolean,
+): IncrementalWindowDecision {
+  if (!baseline) {
+    return { useIncrementalWindow: false, reuseSavedWindow: false, reason: 'no-baseline' };
+  }
+
+  if (
+    savedState &&
+    savedState.parallelism === 1 &&
+    savedState.segments.length === 1 &&
+    savedState.segments[0].after === baseline &&
+    savedState.segments[0].before.length > 0 &&
+    !savedState.segments[0].done
+  ) {
+    return { useIncrementalWindow: true, reuseSavedWindow: true, reason: 'ok' };
+  }
+
+  if (!savedState) {
+    return archiveComplete
+      ? { useIncrementalWindow: true, reuseSavedWindow: false, reason: 'ok' }
+      : { useIncrementalWindow: false, reuseSavedWindow: false, reason: 'unknown-state' };
+  }
+
+  if (isResumeComplete(savedState)) {
+    return { useIncrementalWindow: true, reuseSavedWindow: false, reason: 'ok' };
+  }
+
+  return { useIncrementalWindow: false, reuseSavedWindow: false, reason: 'pending-shards' };
 }
 
 export function getSegmentState(

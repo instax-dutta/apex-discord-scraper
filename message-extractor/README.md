@@ -353,6 +353,11 @@ Live capture and bulk extraction share one archive: part numbers continue
 where extraction stopped, so a later `--incremental` catch-up picks up exactlywhere live capture left off (and vice versa). `Ctrl-C` flushes everything
 buffered before exiting.
 
+The library-level `UserTokenExtractor.close()` stops live admission synchronously
+and then releases the directory; it is not an asynchronous drain barrier. A flush
+already in flight when it is called can finish after the lock is released. The CLI
+signal path calls `capture.stop()` first so its normal shutdown drains before close.
+
 A capture never writes history twice. Anything at or below the channel's
 stored baseline - the newest id the archive already holds - is dropped, so
 restarting `live`, or a replayed dispatch after a Gateway reconnect, cannot
@@ -439,11 +444,13 @@ the file yourself if you want it to track a fresh archive.
 
 ### Resume Interrupted Extraction
 
-If extraction was interrupted, simply run extract again - it will resume from where it left off with **no duplicates**:
+An interrupted extraction retains durable per-shard progress, so the same command resumes from where it left off with **no duplicates**:
 
 ```bash
 npm run extract -- 987654321098765434
 ```
+
+If the previous process exited without releasing `<DB_PATH>.lock`, verify that it is no longer active and follow the recovery procedure under [Limitations](#limitations) before rerunning.
 
 ### Reset Extraction Progress
 
@@ -473,7 +480,7 @@ Every command is also available directly as `node dist/cli.js <command>` or
 | `status` | Per-channel progress, resume state, shard balance, rate limiter |
 | `dump <id> [file]` | Stream a channel out to a single JSON file |
 | `reset <id...>` | Forget progress and delete chunks for a channel |
-| `query "<sql>"` | Run read-only SQL against the metadata database |
+| `query "<sql>"` | Run SQL against the metadata database while holding the writer lock |
 
 ### `extract` options
 
@@ -873,8 +880,11 @@ tool), so the numbers to tune are:
 | `CHUNK_SIZE` | Messages per chunk file. Larger = fewer files, more memory per write. |
 | `PAGE_DELAY_MS` | Pause between pages within a shard (default 100). |
 
-Interrupting is always safe: `Ctrl-C`, a crash, or a reboot, then rerun the
-same command. Progress is per-shard, durable, and validated at startup.
+Interrupting never makes the archive unrecoverable: progress is per-shard,
+durable, and validated at startup. A `Ctrl-C`, crash, or reboot can nevertheless
+leave `<DB_PATH>.lock` behind. Before rerunning after a crash or reboot, verify
+that no writer is active, then remove the lock or explicitly override it using
+the procedure under [Limitations](#limitations).
 
 ### Environment variables
 
@@ -1082,6 +1092,18 @@ docker run -v $(pwd)/data:/app/data -e DISCORD_USER_TOKEN=your_token apex-scrape
 
 ## Limitations
 
+- **One process per data directory**: every command that opens the data directory, including
+  `query`, takes an exclusive lock on `<DB_PATH>.lock`, so a second run against the same `DB_PATH`
+  stops immediately instead of corrupting the archive. An existing lock is never taken or reclaimed
+  automatically, even if its recorded process has died. Without the override, the error reports the
+  recorded pid, host, and acquisition time but does not probe liveness. If you have verified that no
+  writer is active, remove the lock file manually or set `APEX_SCRAPER_FORCE_UNLOCK=1` and retry;
+  the override explicitly accepts the risk of racing another writer. If the lock file cannot be read
+  or lacks usable owner metadata, its owner is unknown and the override cannot establish ownership,
+  so remove it manually only after identifying the owner. Ownership tokens prevent a stale handle
+  from releasing a normally reacquired lock, but that protection assumes the file is not manually
+  replaced between the token check and removal. Manual replacement has the same race risk as the
+  override and must never be done while a writer is active.
 - **Access limited to your permissions**: You can only extract channels you can already read in Discord.
 - **History starts when you joined**: Discord only serves message history from the point you
   gained access to the channel. No tool can retrieve what was there before you could see it -
